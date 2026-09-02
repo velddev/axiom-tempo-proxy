@@ -324,8 +324,14 @@ func TestTraceByIDProto(t *testing.T) {
 	var parentOK bool
 	for _, rs := range res.Trace.ResourceSpans {
 		for _, ss := range rs.ScopeSpans {
+			if ss.Scope == nil {
+				t.Error("scope must never be nil (Grafana dereferences it)")
+			}
 			for _, sp := range ss.Spans {
 				names = append(names, sp.Name)
+				if sp.Status == nil {
+					t.Errorf("span %s: status must never be nil (Grafana dereferences it)", sp.Name)
+				}
 				if hex.EncodeToString(sp.TraceId) != traceA {
 					t.Errorf("trace id = %x", sp.TraceId)
 				}

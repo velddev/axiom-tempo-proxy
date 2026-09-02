@@ -136,6 +136,10 @@ func (e *Evaluator) evalCompare(ctx context.Context, mq *translate.MetricsQuery,
 	wg.Wait()
 	for _, r := range results {
 		if r.err != nil {
+			if ctx.Err() != nil {
+				// The client went away; nothing to report.
+				return nil, ctx.Err()
+			}
 			// One bad attribute (for example a type mismatch) should not
 			// fail the whole comparison.
 			e.opts.Log.Warn("compare attribute failed", "attribute", attrs[r.idx].attr.String(), "err", r.err)

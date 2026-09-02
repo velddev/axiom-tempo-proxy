@@ -42,10 +42,9 @@ func ToOTLP(t *spans.Trace) *tempopb.Trace {
 		sk := s.ScopeName + "\x00" + s.ScopeVersion
 		sg, ok := rg.byKey[sk]
 		if !ok {
-			sg = &scopeGroup{}
-			if s.ScopeName != "" || s.ScopeVersion != "" {
-				sg.scope = &common.InstrumentationScope{Name: s.ScopeName, Version: s.ScopeVersion}
-			}
+			// Grafana's transformer dereferences Scope and Status without
+			// nil checks, so always populate them.
+			sg = &scopeGroup{scope: &common.InstrumentationScope{Name: s.ScopeName, Version: s.ScopeVersion}}
 			rg.byKey[sk] = sg
 			rg.scopes = append(rg.scopes, sg)
 		}
@@ -74,9 +73,7 @@ func toSpan(s *spans.Span) *v1.Span {
 		StartTimeUnixNano: s.StartNs,
 		EndTimeUnixNano:   s.StartNs + s.DurationNs,
 		Attributes:        keyValues(s.SpanAttrs),
-	}
-	if s.Status != traceql.StatusUnset || s.StatusMessage != "" {
-		span.Status = &v1.Status{Code: statusCode(s.Status), Message: s.StatusMessage}
+		Status:            &v1.Status{Code: statusCode(s.Status), Message: s.StatusMessage},
 	}
 	for _, e := range s.Events {
 		span.Events = append(span.Events, &v1.Span_Event{
