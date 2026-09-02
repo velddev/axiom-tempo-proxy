@@ -8,9 +8,9 @@
 // satisfy the query's spanset structure (both sides present for && and
 // structural operators, either side for ||). The rest pull the spans of
 // those traces in batches of candidate ids, in candidate order, until the
-// span budget (MaxSpans) is spent. Spans are grouped into spansets and
-// handed to the engine's second pass, which applies the full TraceQL
-// semantics.
+// span budget (MaxSpans) is spent, projecting only the columns the
+// query's attributes need. Spans are grouped into spansets and handed to
+// the engine's second pass, which applies the full TraceQL semantics.
 //
 // A trace is only ever returned with all of its spans: when a batch query
 // hits its own row limit the traces it could not fetch completely are
@@ -150,7 +150,10 @@ func (f *Fetcher) Fetch(ctx context.Context, req traceql.FetchSpansRequest) (tra
 		return traceql.FetchSpansResponse{Results: &iterator{}, Stats: f.fetchStats}, nil
 	}
 
-	traces, err := f.pullTraces(ctx, ids, start, end)
+	// The pull only needs the columns backing the attributes this request
+	// exposes; a real dataset has hundreds of columns and a query touches
+	// a handful of them.
+	traces, err := f.pullTraces(ctx, ids, start, end, projectColumns(f.tr.Mapping(), req))
 	if err != nil {
 		return traceql.FetchSpansResponse{}, err
 	}
@@ -251,8 +254,9 @@ func (f *Fetcher) candidates(ctx context.Context, start, end time.Time) ([]strin
 // BatchTraces ids, in candidate order, and groups them, preserving that
 // order. Batches stop once the span budget (MaxSpans) is spent; traces
 // that could not be fetched whole are dropped and counted, so every trace
-// returned carries all of its spans.
-func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.Time) ([]*spans.Trace, error) {
+// returned carries all of its spans. cols, when non-empty, restricts the
+// pull to those dataset columns.
+func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.Time, cols []string) ([]*spans.Trace, error) {
 	from, to := start.Add(-f.opts.TracePadding), end.Add(f.opts.TracePadding)
 	budget := f.opts.MaxSpans
 	size := f.opts.BatchTraces
@@ -265,7 +269,7 @@ func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.
 			break
 		}
 		batch := ids[i:min(i+size, len(ids))]
-		traces, rows, complete, err := f.pullBatch(ctx, batch, budget, from, to)
+		traces, rows, complete, err := f.pullBatch(ctx, batch, budget, from, to, cols)
 		if err != nil {
 			return nil, err
 		}
@@ -312,10 +316,11 @@ func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.
 // are sorted by trace id so that the overflow lands on a trace boundary:
 // every trace but the last one in that order is whole, and the last one
 // is dropped.
-func (f *Fetcher) pullBatch(ctx context.Context, ids []string, budget int, from, to time.Time) ([]*spans.Trace, int, bool, error) {
+func (f *Fetcher) pullBatch(ctx context.Context, ids []string, budget int, from, to time.Time, cols []string) ([]*spans.Trace, int, bool, error) {
 	m := f.tr.Mapping()
 	q := apl.NewQuery(f.opts.Dataset).
 		Where(translate.TraceIDsFilter(m, ids)).
+		Project(projectExprs(cols)...).
 		Sort(m.TraceID().Expr + " asc").
 		Limit(budget + 1)
 
@@ -611,9 +616,11 @@ type TraceStatus struct {
 	Message string
 }
 
-// FetchTrace pulls one trace by hex id within the window. The returned
-// status says whether the trace is complete: a query that comes back with
-// as many rows as it asked for has almost certainly left spans behind.
+// FetchTrace pulls one trace by hex id within the window. It never
+// projects: the trace view shows every attribute a span carries. The
+// returned status says whether the trace is complete: a query that comes
+// back with as many rows as it asked for has almost certainly left spans
+// behind.
 func FetchTrace(ctx context.Context, client *axiom.Client, tr *translate.Translator, opts Options, hexID string, start, end time.Time) (*spans.Trace, TraceStatus, error) {
 	opts = opts.withDefaults()
 	m := tr.Mapping()

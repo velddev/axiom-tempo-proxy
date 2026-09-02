@@ -29,7 +29,11 @@ search, tag autocomplete, and the RED metrics panels.
 - **Search** pushes the query's spanset filters down to APL to find
   candidate traces, pulls the spans of those traces, and runs Tempo's own
   TraceQL engine in-process over them. Structural operators, aggregates,
-  `select`, `by`, and `coalesce` all work exactly as in Tempo.
+  `select`, `by`, and `coalesce` all work exactly as in Tempo. The span
+  pull `project`s only the columns the query needs — the intrinsics, the
+  resource identity, and the columns backing the attributes the query
+  filters on or `select`s — so a 183-column dataset moves a fraction of
+  the bytes. Trace by id still fetches every column.
 - **Partial results are explicit.** The span pull runs in batches of
   `PROXY_SEARCH_BATCH_TRACES` candidate traces (one query when they all
   fit) and stops once the `PROXY_MAX_SPANS_PER_FETCH` budget is spent, so
