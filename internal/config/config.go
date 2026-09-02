@@ -30,7 +30,8 @@ type Config struct {
 	Dataset string
 	// DatasetHeader names a request header that may override Dataset.
 	DatasetHeader string
-	// AllowedDatasets restricts header overrides; empty allows any.
+	// AllowedDatasets restricts which datasets a request may select;
+	// empty allows any.
 	AllowedDatasets []string
 
 	// SchemaRefresh is how often dataset fields are re-discovered.
@@ -57,7 +58,8 @@ type Config struct {
 	// MaxTraceIntrinsicTraces caps the traces a metrics query filtering
 	// on trace-level intrinsics may resolve to before it is refused.
 	MaxTraceIntrinsicTraces int
-	// TagSampleRows is how many rows are sampled to discover map keys.
+	// TagSampleRows is how many rows are sampled to discover the keys
+	// inside map fields and inside the events and links arrays.
 	TagSampleRows int
 	// DefaultLookback is the search window when the client omits one.
 	DefaultLookback time.Duration
@@ -185,7 +187,7 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&c.DefaultExemplars, "default-exemplars", c.DefaultExemplars, "exemplars per series when the request does not ask for a number (0 disables)")
 	fs.IntVar(&c.MaxExemplars, "max-exemplars", c.MaxExemplars, "cap on exemplars per series")
 	fs.IntVar(&c.MaxTraceIntrinsicTraces, "max-trace-intrinsic-traces", c.MaxTraceIntrinsicTraces, "cap on traces a trace-level metrics filter may resolve to")
-	fs.IntVar(&c.TagSampleRows, "tag-sample-rows", c.TagSampleRows, "rows sampled to discover map keys")
+	fs.IntVar(&c.TagSampleRows, "tag-sample-rows", c.TagSampleRows, "rows sampled to discover map, event and link keys")
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
@@ -196,7 +198,7 @@ func Load(args []string) (Config, error) {
 	return c, nil
 }
 
-// DatasetAllowed reports whether a header-selected dataset may be used.
+// DatasetAllowed reports whether a request-selected dataset may be used.
 func (c Config) DatasetAllowed(name string) bool {
 	if name == c.Dataset {
 		return true

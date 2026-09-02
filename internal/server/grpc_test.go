@@ -239,10 +239,9 @@ func TestGRPCDatasetSelection(t *testing.T) {
 	}
 }
 
-// TestGRPCCarriesPartialAndEventResults checks that the behaviour the HTTP
-// handlers grew — dropped traces, Axiom's partial status, event attribute
-// values — reaches streaming clients too, since both share the run*
-// functions.
+// TestGRPCCarriesPartialAndEventResults checks that dropped traces,
+// Axiom's partial status and event attribute values reach streaming
+// clients too, since both transports share the run* functions.
 func TestGRPCCarriesPartialAndEventResults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

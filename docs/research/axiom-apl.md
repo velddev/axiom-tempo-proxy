@@ -1,6 +1,6 @@
-# Axiom trace querying reference for a Tempo→APL proxy
+# Axiom trace querying reference for a Tempo to APL proxy
 
-Research compiled 2026-09-02 from official Axiom docs, axiom-go, and axiom-grafana. Items that could not be verified from official sources are marked **UNVERIFIED** and must be confirmed against a live dataset.
+Reference notes compiled from the official Axiom documentation, axiom-go, and axiom-grafana. Items the official sources do not settle are marked **UNVERIFIED** and should be confirmed against a real dataset before being relied on.
 
 ## 1. Axiom's OTLP trace schema
 
@@ -82,8 +82,8 @@ Errors: JSON `{"message": "..."}`. 403 auth, 429 rate limit, 430 limit reached, 
 - `project a, b, c = expr`, `project-away`, `extend x = expr`.
 - `summarize [Alias =] Agg [, ...] [by ...]`: `count()`, `countif(pred)`, `dcount(f)`, `avg`, `min`, `max`, `sum` (+ `if` variants), `percentile(f, p)`, `percentiles_array(f, p1, p2, ...)`, `histogram(f, nbins)`, `make_list`, `make_set(f, [limit])`, `arg_max(expr, f1, ..., *)`, `arg_min`, `topk(f, k)`, `rate(f)`, `stdev`, `variance`. Default names: `count_`, `avg_duration`, `dcount_trace_id`. Time bins: `bin(_time, 1m)`, `bin_auto(_time)`. Gotcha: time bin first in `by` + `limit` → global top-N groups per bucket.
 - `sort by f desc`, `order by`, `top N by expr`, `limit N` / `take N`, `distinct f1, f2`, `count`.
-- `union`: `['a'] | union ['b'], ['c']`, `union withsource=dataset github*`. (Not needed: one dataset per env.)
-- `join kind=inner|innerunique|leftouter Right on trace_id` — public preview, only these kinds, 50k rows/side, not usable in dashboard queries. Parenthesized subquery on the right **UNVERIFIED**.
+- `union`: `['a'] | union ['b'], ['c']`, `union withsource=dataset github*`. (Not used: the proxy queries a single dataset per request.)
+- `join kind=inner|innerunique|leftouter Right on trace_id`: public preview, only these kinds, 50k rows/side, not usable in dashboard queries. Parenthesized subquery on the right **UNVERIFIED**.
 - `let x = dynamic([...]);` documented; `let` bound to a dataset pipeline **UNVERIFIED**. No window functions. `bag_keys(map)` exists; `bag_unpack` does not; `mv-expand` **UNVERIFIED**. `case(c1, r1, ..., default)`, `iff(pred, a, b)`, `isnull`, `isnotnull`, `isempty`, `isnotempty`, `coalesce`, `strcat`, `tolower`, `extract(regex, group, text)`.
 
 ## 4. Schema discovery
@@ -175,39 +175,40 @@ Map key enumeration (tag names inside `attributes.custom`):
 
 - axiom-grafana has no Tempo-compatible API. Its `pkg/plugin/traces.go` builds a Grafana trace frame when a result has trace fields; aliases: traceID (`trace_id`, `traceID`, `traceId`, `trace.id`), spanID, operationName (`name`, `operationName`, `span.name`), serviceName (`service.name`, `resource.service.name`, `service_name`), startTime (`_time`, `timestamp`, `startTime`), duration (`duration`, `durationMs`, `durationNs`). Bare numeric `duration` treated as nanoseconds. Flattens `attributes` maps into dot-keyed tags, turns `events` into logs.
 
-## 7. Verified against a live dataset (2026-09-02)
+## 7. Observed query-engine behaviour
 
-Measured while adding trace-level intrinsics to the metrics path.
+Behaviour of the query engine that the documentation does not state, and
+that a proxy generating APL has to work around.
 
 - **`where x in (<subquery>)` does not exist.** A parenthesised pipeline on
   the right of `in` is a hard 400: *"the in parameter can not currently
   handle table expressions with operations"*. Only literal lists work.
-- **`join` silently truncates its left side at 50,000 rows.** A join of
-  510,000 spans against a 15-row right side returned exactly 50,000 rows
-  with `isEstimate` unset and **no message at all**. An oversized right
-  side does warn (`join_rhs_limit_warning`). Treat `join` as unusable for
-  anything that must be exact.
-- **`summarize ... by <high-cardinality>` truncates.** Grouping all spans
-  of a busy hour by `trace_id` returned ~12,000 of ~207,000 groups, and the
-  number varies between runs. Truncation always came with
-  `status.isEstimate = true` plus a `max_limit_warning` message, and
-  narrow queries (a few thousand groups) were always exact with neither.
-  An explicit `| limit N` raises the same two flags, so a query that wants
-  to use them as a truncation signal must not carry one; end it with a
+- **`join` silently truncates its left side at 50,000 rows.** An oversized
+  left side comes back at exactly 50,000 rows with `isEstimate` unset and
+  no message at all. An oversized right side does warn
+  (`join_rhs_limit_warning`). Treat `join` as unusable for anything that
+  must be exact.
+- **`summarize ... by <high-cardinality>` truncates.** Grouping a large
+  span volume by `trace_id` returns a fraction of the groups, and the
+  number varies between runs. Truncation comes with
+  `status.isEstimate = true` plus a `max_limit_warning` message; narrow
+  queries of a few thousand groups are exact and carry neither flag. An
+  explicit `| limit N` raises the same two flags, so a query that uses
+  them as a truncation signal must not carry one. End it with a
   single-row `summarize count(), make_list(f, N)` instead.
 - **`make_list(f, N)`** caps the list at N while `count()` in the same
   `summarize` still reports the true number, which is how overflow is
   detected. An empty input yields one row with `0` and `[]`.
 - **Per-trace roll-ups.** `max(_time + duration) - min(_time)` returns a
-  bare nanosecond number (comparisons against `2s`, `timespan(2s)` and
-  `2000000000` all agree); `todatetime(max(...)) - todatetime(min(...))`
-  returns a real timespan and is what the proxy generates.
-  `summarize r = arg_min(key, a, b)` names its outputs `a` and `b` (not
-  `r_a`), so the values must be aliased with `extend` first.
-- **A 5000-element literal `in (...)` list** (~180 KB of query body) is
-  accepted without complaint.
+  bare nanosecond number; comparisons against `2s`, `timespan(2s)` and
+  `2000000000` all agree. `todatetime(max(...)) - todatetime(min(...))`
+  returns a real timespan.
+  `summarize r = arg_min(key, a, b)` names its outputs `a` and `b`, not
+  `r_a`, so the values must be aliased with `extend` first.
+- **A 5000-element literal `in (...)` list**, roughly 180 KB of query
+  body, is accepted.
 
-## Open items to verify against live data
+## Open items to confirm against a real dataset
 
 1. `status.code` literals and casing; `kind` casing.
 2. Structure of `events[]` and `links[]`.

@@ -242,8 +242,8 @@ func (e *Evaluator) applyStatus(res *tempopb.QueryRangeResponse) {
 // exemplarCount resolves how many exemplars per series to produce,
 // mirroring Tempo's normalizeRequestExemplars: an integer
 // with(exemplars=N) hint wins, with(exemplars=false) disables them, and
-// a request that names no number gets the configured default. Note that
-// with(exemplars=true) is a no-op in Tempo, and that an explicit
+// a request that names no number gets the configured default.
+// with(exemplars=true) is a no-op in Tempo, and an explicit
 // exemplars=0 means "unspecified", not "none".
 func (e *Evaluator) exemplarCount(mq *translate.MetricsQuery, requested int) int {
 	hint := strings.ToLower(strings.TrimSpace(mq.Hints["exemplars"]))
