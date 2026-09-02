@@ -15,6 +15,7 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 
+	"github.com/velddev/axiom-tempo-proxy/internal/apl"
 	"github.com/velddev/axiom-tempo-proxy/internal/axiom"
 	"github.com/velddev/axiom-tempo-proxy/internal/config"
 	"github.com/velddev/axiom-tempo-proxy/internal/metrics"
@@ -131,6 +132,8 @@ type datasetSchema struct {
 	translator  *translate.Translator
 	spanKeys    []string // sampled keys of the span custom map
 	resKeys     []string // sampled keys of the resource custom map
+	eventKeys   []string // sampled attribute keys inside the events array
+	linkKeys    []string // sampled attribute keys inside the links array
 	fetchedAt   time.Time
 	discovered  bool
 	refreshing  bool
@@ -248,8 +251,15 @@ func (c *schemaCache) discover(ctx context.Context, dataset string) (*datasetSch
 	if m.HasField(cfg.ResourceCustomMap) {
 		entry.resKeys = c.sampleKeys(ctx, dataset, cfg.ResourceCustomMap)
 	}
+	if attrs, ok := m.ExpandedEventAttributes(); ok {
+		entry.eventKeys = c.sampleArrayKeys(ctx, dataset, m, m.Events().Expr, attrs)
+	}
+	if attrs, ok := m.ExpandedLinkAttributes(); ok {
+		entry.linkKeys = c.sampleArrayKeys(ctx, dataset, m, m.Links().Expr, attrs)
+	}
 	c.log.Info("discovered dataset schema", "dataset", dataset, "fields", len(fields),
-		"span_map_keys", len(entry.spanKeys), "resource_map_keys", len(entry.resKeys))
+		"span_map_keys", len(entry.spanKeys), "resource_map_keys", len(entry.resKeys),
+		"event_attr_keys", len(entry.eventKeys), "link_attr_keys", len(entry.linkKeys))
 	return entry, nil
 }
 
@@ -285,9 +295,28 @@ func (c *schemaCache) fieldsFromQuery(ctx context.Context, dataset string) ([]ax
 // sampleKeys reads map keys from a sample of recent rows.
 func (c *schemaCache) sampleKeys(ctx context.Context, dataset, field string) []string {
 	q := fmt.Sprintf("['%s']\n| where isnotnull(['%s'])\n| take %d\n| project k = bag_keys(['%s'])", dataset, field, c.sample, field)
+	return c.keysFromQuery(ctx, dataset, field, q)
+}
+
+// sampleArrayKeys reads the attribute keys carried inside an array column
+// (events, links) from a sample of recent rows. The sample is taken before
+// the expansion so the cost stays bounded by rows scanned, and mv-expand is
+// written without an alias because APL rejects one.
+func (c *schemaCache) sampleArrayKeys(ctx context.Context, dataset string, m *schema.Mapping, col, attrs string) []string {
+	q := apl.NewQuery(dataset).
+		Where(m.SpansOnly()).
+		Where(apl.Call("isnotnull", col)).
+		Raw(fmt.Sprintf("take %d", c.sample)).
+		Raw("mv-expand " + col).
+		Project("k = " + apl.Call("bag_keys", attrs))
+	return c.keysFromQuery(ctx, dataset, col, q.String())
+}
+
+// keysFromQuery runs a key-sampling query and unions the k arrays it returns.
+func (c *schemaCache) keysFromQuery(ctx context.Context, dataset, field, q string) []string {
 	res, err := c.client.Query(ctx, q, axiom.QueryOptions{Start: time.Now().Add(-24 * time.Hour), End: time.Now()})
 	if err != nil {
-		c.log.Warn("map key sampling failed", "dataset", dataset, "field", field, "err", err)
+		c.log.Warn("key sampling failed", "dataset", dataset, "field", field, "err", err)
 		return nil
 	}
 	t := res.FirstTable()

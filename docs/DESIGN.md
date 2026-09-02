@@ -57,6 +57,20 @@ error rather than returning wrong numbers.
 `summarize count() by value` with the `q` filter pushed down; an
 unparsable `q` degrades to the unfiltered list, as Tempo does.
 
+The `event` scope is listed too, from keys sampled out of the `events`
+array (`take N | mv-expand events | project bag_keys(events['attributes'])`,
+unioned over the rows) and cached with the rest of the schema. Event tag
+values (`event.exception.message`, `event:name`) expand the array as
+well: the `q` filter is applied to whole spans first, where the per-slot
+`events[i]` expressions the translator emits are still meaningful, and
+only then are the rows expanded to one event each and grouped. APL will
+not group by a value of unknown type, which is what indexing into a
+dynamic yields, so event values are always strings. `mv-expand` takes no
+alias, so the expanded element keeps the column's own name. A scope with
+no tags is omitted, so `link` never appears on a dataset without a
+`links` column, and no query names one: APL fails a query outright when
+it references a field the dataset does not have.
+
 ## Axiom schema assumptions
 
 See `docs/research/axiom-apl.md`. Semantic-convention attributes are flat

@@ -39,7 +39,11 @@ search, tag autocomplete, and the RED metrics panels.
   pushed down too: the `events` array has no per-row "any element
   matches" construct in APL, so the test is repeated over the first
   `MaxEventsPerSpan` (8) event slots and or-ed. Spans with more events
-  than that are only matched on their first eight.
+  than that are only matched on their first eight. The tag endpoints
+  cover them too: `/api/v2/search/tags` lists an `event` scope of the
+  attribute keys found in the data, and tag values for
+  `event.<key>`/`event:name` expand the array (`mv-expand`) after the
+  `q` filter has been pushed down, so they come back as strings.
 - **Metrics** are translated to native APL `summarize ... by bin(_time, step)`
   aggregations, so they scale with Axiom rather than with the proxy.
 - The dataset's field list is discovered at startup (and refreshed) so

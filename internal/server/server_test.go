@@ -199,6 +199,27 @@ func defaultRespond(apl string) ([]axiom.Field, [][]any) {
 		return fieldsOf("k", "array"), [][]any{{[]string{"app.user.id", "cart.items"}}, {[]string{"peer.service", "db.system.name"}}}
 	case strings.Contains(apl, "bag_keys(['resource.custom'])"):
 		return fieldsOf("k", "array"), [][]any{{[]string{"deployment.environment"}}}
+	case strings.Contains(apl, "bag_keys(events['attributes'])"):
+		// Event attribute key discovery. Real data yields one row per
+		// event, and events without attributes come back as empty arrays.
+		return fieldsOf("k", "array"), [][]any{
+			{[]string{"exception.type", "exception.message"}},
+			{[]string{}},
+			{[]string{"exception.stacktrace", "exception.type"}},
+		}
+	case strings.Contains(apl, "mv-expand events"):
+		// Event tag values: rows are expanded, then grouped by the string
+		// form of one event field.
+		switch {
+		case strings.Contains(apl, `tostring(events['attributes']['exception.message'])`):
+			if strings.Contains(apl, `['service.name'] == "backend"`) {
+				return fieldsOf("v", "string", "c", "integer"), [][]any{{"boom", 3}}
+			}
+			return fieldsOf("v", "string", "c", "integer"), [][]any{{"boom", 7}, {"kaput", 2}}
+		case strings.Contains(apl, `tostring(events['name'])`):
+			return fieldsOf("v", "string", "c", "integer"), [][]any{{"exception", 9}, {"log", 4}}
+		}
+		return nil, nil
 	case strings.HasSuffix(apl, "| limit 1"):
 		// Schema probe: every column, one row.
 		return spanFields(), spanRows(traceA)[:1]
@@ -577,6 +598,133 @@ func TestTagValuesV2(t *testing.T) {
 	h.getJSON(t, "/api/search/tag/service.name/values", &v1)
 	if len(v1.TagValues) != 2 {
 		t.Errorf("v1 values = %v", v1.TagValues)
+	}
+}
+
+func TestEventTagValues(t *testing.T) {
+	h := newHarness(t, nil)
+
+	var res tempopb.SearchTagValuesV2Response
+	h.getJSON(t, "/api/v2/search/tag/event.exception.message/values?limit=100", &res)
+	if len(res.TagValues) != 2 || res.TagValues[0].Value != "boom" || res.TagValues[0].Type != "string" {
+		t.Fatalf("event values = %v", res.TagValues)
+	}
+	q := h.fake.find(`tostring(events['attributes']['exception.message'])`)
+	for _, want := range []string{
+		"where isnotempty(trace_id)",
+		"where isnotnull(events)",
+		"| mv-expand events",
+		"extend v = tostring(events['attributes']['exception.message'])",
+		"where isnotempty(v)",
+		"summarize c = count() by v",
+		"top 100 by c",
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("event tag values query missing %q:\n%s", want, q)
+		}
+	}
+	// mv-expand rejects aliases, so the expansion must stay unaliased.
+	if strings.Contains(q, "mv-expand e =") {
+		t.Errorf("mv-expand must not be aliased:\n%s", q)
+	}
+	// The filter has to be pushed down before the expansion.
+	if i, j := strings.Index(q, "mv-expand"), strings.Index(q, "isnotempty(trace_id)"); i < j {
+		t.Errorf("mv-expand must come after the row filters:\n%s", q)
+	}
+
+	// With a q filter pushed down.
+	h.getJSON(t, "/api/v2/search/tag/event.exception.message/values?q="+url.QueryEscape(`{ resource.service.name = "backend" }`), &res)
+	if len(res.TagValues) != 1 || res.TagValues[0].Value != "boom" {
+		t.Errorf("filtered event values = %v", res.TagValues)
+	}
+	if q := h.fake.find(`['service.name'] == "backend"`); !strings.Contains(q, "mv-expand events") {
+		t.Errorf("filtered event tag values query:\n%s", q)
+	}
+
+	// An unparsable q still returns the unfiltered list.
+	h.getJSON(t, "/api/v2/search/tag/event.exception.message/values?q="+url.QueryEscape(`{ event.exception.type = }`), &res)
+	if len(res.TagValues) != 2 {
+		t.Errorf("unfiltered event values = %v", res.TagValues)
+	}
+
+	// The event:name intrinsic.
+	h.getJSON(t, "/api/v2/search/tag/event:name/values", &res)
+	if len(res.TagValues) != 2 || res.TagValues[0].Value != "exception" || res.TagValues[1].Value != "log" {
+		t.Errorf("event:name values = %v", res.TagValues)
+	}
+	if q := h.fake.find(`tostring(events['name'])`); !strings.Contains(q, "mv-expand events") {
+		t.Errorf("event:name query:\n%s", q)
+	}
+	// Grafana percent-encodes the colon.
+	var enc tempopb.SearchTagValuesV2Response
+	h.getJSON(t, "/api/v2/search/tag/event%3Aname/values", &enc)
+	if len(enc.TagValues) != 2 {
+		t.Errorf("encoded event:name values = %v", enc.TagValues)
+	}
+
+	// v1 accepts the scoped spelling too.
+	var v1 tempopb.SearchTagValuesResponse
+	h.getJSON(t, "/api/search/tag/event.exception.message/values", &v1)
+	if len(v1.TagValues) != 2 || v1.TagValues[0] != "boom" {
+		t.Errorf("v1 event values = %v", v1.TagValues)
+	}
+	h.getJSON(t, "/api/search/tag/event:name/values", &v1)
+	if len(v1.TagValues) != 2 {
+		t.Errorf("v1 event:name values = %v", v1.TagValues)
+	}
+
+	// event:timeSinceStart is not derivable from the stored elements.
+	var none tempopb.SearchTagValuesV2Response
+	h.getJSON(t, "/api/v2/search/tag/event:timeSinceStart/values", &none)
+	if len(none.TagValues) != 0 {
+		t.Errorf("event:timeSinceStart values = %v", none.TagValues)
+	}
+}
+
+func TestSearchTagsV2EventScope(t *testing.T) {
+	h := newHarness(t, nil)
+
+	// The discovery query samples rows before expanding them.
+	disc := h.fake.find("bag_keys(events['attributes'])")
+	for _, want := range []string{"where isnotnull(events)", "take 2000", "| mv-expand events"} {
+		if !strings.Contains(disc, want) {
+			t.Errorf("event key discovery query missing %q:\n%s", want, disc)
+		}
+	}
+	if i, j := strings.Index(disc, "mv-expand"), strings.Index(disc, "take "); i < j {
+		t.Errorf("the sample must be taken before the expansion:\n%s", disc)
+	}
+
+	var res tempopb.SearchTagsV2Response
+	h.getJSON(t, "/api/v2/search/tags", &res)
+	scopes := map[string][]string{}
+	for _, sc := range res.Scopes {
+		scopes[sc.Name] = sc.Tags
+	}
+	want := []string{"exception.message", "exception.stacktrace", "exception.type"}
+	if fmt.Sprint(scopes["event"]) != fmt.Sprint(want) {
+		t.Errorf("event tags = %v, want %v", scopes["event"], want)
+	}
+	// The dataset has no links column, so nothing may reference one.
+	if _, ok := scopes["link"]; ok {
+		t.Errorf("link scope must be absent without a links column: %v", res.Scopes)
+	}
+	for _, q := range h.fake.recorded() {
+		if strings.Contains(q, "links") {
+			t.Errorf("query references a missing links column:\n%s", q)
+		}
+	}
+
+	// Scoped requests.
+	var only tempopb.SearchTagsV2Response
+	h.getJSON(t, "/api/v2/search/tags?scope=event", &only)
+	if len(only.Scopes) != 1 || only.Scopes[0].Name != "event" || len(only.Scopes[0].Tags) != 3 {
+		t.Errorf("scope=event = %v", only.Scopes)
+	}
+	var empty tempopb.SearchTagsV2Response
+	h.getJSON(t, "/api/v2/search/tags?scope=link", &empty)
+	if len(empty.Scopes) != 0 {
+		t.Errorf("scope=link = %v", empty.Scopes)
 	}
 }
 
