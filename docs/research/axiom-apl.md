@@ -175,11 +175,43 @@ Map key enumeration (tag names inside `attributes.custom`):
 
 - axiom-grafana has no Tempo-compatible API. Its `pkg/plugin/traces.go` builds a Grafana trace frame when a result has trace fields; aliases: traceID (`trace_id`, `traceID`, `traceId`, `trace.id`), spanID, operationName (`name`, `operationName`, `span.name`), serviceName (`service.name`, `resource.service.name`, `service_name`), startTime (`_time`, `timestamp`, `startTime`), duration (`duration`, `durationMs`, `durationNs`). Bare numeric `duration` treated as nanoseconds. Flattens `attributes` maps into dot-keyed tags, turns `events` into logs.
 
+## 7. Verified against a live dataset (2026-09-02)
+
+Measured while adding trace-level intrinsics to the metrics path.
+
+- **`where x in (<subquery>)` does not exist.** A parenthesised pipeline on
+  the right of `in` is a hard 400: *"the in parameter can not currently
+  handle table expressions with operations"*. Only literal lists work.
+- **`join` silently truncates its left side at 50,000 rows.** A join of
+  510,000 spans against a 15-row right side returned exactly 50,000 rows
+  with `isEstimate` unset and **no message at all**. An oversized right
+  side does warn (`join_rhs_limit_warning`). Treat `join` as unusable for
+  anything that must be exact.
+- **`summarize ... by <high-cardinality>` truncates.** Grouping all spans
+  of a busy hour by `trace_id` returned ~12,000 of ~207,000 groups, and the
+  number varies between runs. Truncation always came with
+  `status.isEstimate = true` plus a `max_limit_warning` message, and
+  narrow queries (a few thousand groups) were always exact with neither.
+  An explicit `| limit N` raises the same two flags, so a query that wants
+  to use them as a truncation signal must not carry one; end it with a
+  single-row `summarize count(), make_list(f, N)` instead.
+- **`make_list(f, N)`** caps the list at N while `count()` in the same
+  `summarize` still reports the true number, which is how overflow is
+  detected. An empty input yields one row with `0` and `[]`.
+- **Per-trace roll-ups.** `max(_time + duration) - min(_time)` returns a
+  bare nanosecond number (comparisons against `2s`, `timespan(2s)` and
+  `2000000000` all agree); `todatetime(max(...)) - todatetime(min(...))`
+  returns a real timespan and is what the proxy generates.
+  `summarize r = arg_min(key, a, b)` names its outputs `a` and `b` (not
+  `r_a`), so the values must be aliased with `extend` first.
+- **A 5000-element literal `in (...)` list** (~180 KB of query body) is
+  accepted without complaint.
+
 ## Open items to verify against live data
 
 1. `status.code` literals and casing; `kind` casing.
 2. Structure of `events[]` and `links[]`.
 3. `resource.custom` vs flat `resource.*` per dataset.
 4. Wire encoding of `timespan` in tabular JSON.
-5. `in (subquery)`, `join (subquery)`, `let` pipelines, `mv-expand`, `between`.
-6. Query timeouts and cardinality caps.
+5. `let` pipelines, `mv-expand`, `between`.
+6. Query timeouts, and the exact rule behind the `summarize` group cap.

@@ -835,11 +835,12 @@ func normalizeMetricsRequest(req *metrics.Request, instant bool) error {
 
 func (s *Server) evaluator(ds *datasetSchema) *metrics.Evaluator {
 	return metrics.New(s.client, ds.translator, metrics.Options{
-		Dataset:          ds.name,
-		DefaultExemplars: s.cfg.DefaultExemplars,
-		MaxExemplars:     s.cfg.MaxExemplars,
-		Log:              s.log,
-		LogQueries:       s.cfg.LogQueries,
+		Dataset:                 ds.name,
+		DefaultExemplars:        s.cfg.DefaultExemplars,
+		MaxExemplars:            s.cfg.MaxExemplars,
+		MaxTraceIntrinsicTraces: s.cfg.MaxTraceIntrinsicTraces,
+		Log:                     s.log,
+		LogQueries:              s.cfg.LogQueries,
 	})
 }
 

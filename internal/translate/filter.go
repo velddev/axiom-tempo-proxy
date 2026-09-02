@@ -32,6 +32,11 @@ type Filter struct {
 // Translator renders TraceQL field expressions against a schema mapping.
 type Translator struct {
 	m *schema.Mapping
+	// trace is non-nil while a trace-level predicate is being rendered
+	// and maps the trace intrinsics onto the columns that hold their
+	// per-trace values. In the normal per-span mode it is nil and those
+	// intrinsics stay unsupported.
+	trace *traceColumns
 }
 
 // New creates a Translator.
@@ -387,6 +392,12 @@ func (t *Translator) arith(b *traceql.BinaryOperation, f *Filter) (string, schem
 // specialIntrinsic handles intrinsics that do not map to a plain column.
 // handled=false means the attribute is ordinary.
 func (t *Translator) specialIntrinsic(a traceql.Attribute, op traceql.Operator, st traceql.Static) (expr string, handled, ok bool) {
+	if !a.Parent {
+		if col, found := t.traceCol(a.Intrinsic); found {
+			expr, ok := t.traceIntrinsicPredicate(col, op, st)
+			return expr, true, ok
+		}
+	}
 	switch a.Intrinsic {
 	case traceql.IntrinsicNestedSetParent:
 		// Root spans have nestedSetParent < 0 (Tempo assigns -1).

@@ -970,10 +970,163 @@ func TestMetricsCompare(t *testing.T) {
 
 func TestMetricsUnsupportedFilterIs400(t *testing.T) {
 	h := newHarness(t, nil)
-	q := url.QueryEscape(`{ traceDuration > 1s } | rate()`)
-	status, body := h.get(t, fmt.Sprintf("/api/metrics/query_range?q=%s&start=%d&end=%d", q, t0.Unix(), t0.Add(time.Minute).Unix()), "")
-	if status != 400 || !strings.Contains(string(body), "unsupported") {
-		t.Errorf("status = %d body = %s", status, body)
+	for _, q := range []string{
+		// Needs the span tree, which APL cannot walk.
+		`{ span:childCount > 2 } | rate()`,
+		`{ nestedSetLeft > 3 } | rate()`,
+		`{ parent.span.http.method = "GET" } | rate()`,
+		`{ link:traceID = "abc" } | rate()`,
+		// A trace-level term inside a disjunction cannot be split off.
+		`{ traceDuration > 1s || status = error } | rate()`,
+	} {
+		status, body := h.get(t, fmt.Sprintf("/api/metrics/query_range?q=%s&start=%d&end=%d",
+			url.QueryEscape(q), t0.Unix(), t0.Add(time.Minute).Unix()), "")
+		if status != 400 || !strings.Contains(string(body), "unsupported") {
+			t.Errorf("%s: status = %d body = %s", q, status, body)
+		}
+	}
+}
+
+// traceIDTable answers a per-trace query with the ids it resolved to.
+func traceIDTable(ids ...string) ([]axiom.Field, [][]any) {
+	list := make([]any, 0, len(ids))
+	for _, id := range ids {
+		list = append(list, id)
+	}
+	return fieldsOf("_n", "integer", "_ids", "array"), [][]any{{len(ids), list}}
+}
+
+// { traceDuration > 2s } | rate(): the trace duration is aggregated per
+// trace and the qualifying ids restrict the rate query.
+func TestMetricsTraceDuration(t *testing.T) {
+	bucket := t0.Truncate(time.Minute)
+	h := newHarness(t, func(apl string) ([]axiom.Field, [][]any) {
+		switch {
+		case strings.Contains(apl, "_td = todatetime"):
+			return traceIDTable(traceA)
+		case strings.Contains(apl, "summarize v = count()"):
+			return fieldsOf("_bucket", "datetime", "v", "integer"), [][]any{
+				{bucket.Format(time.RFC3339Nano), 180},
+			}
+		}
+		return defaultRespond(apl)
+	})
+	var res tempopb.QueryRangeResponse
+	q := url.QueryEscape(`{ traceDuration > 2s } | rate()`)
+	h.getJSON(t, fmt.Sprintf("/api/metrics/query_range?q=%s&start=%d&end=%d&step=60",
+		q, bucket.Unix(), bucket.Add(2*time.Minute).Unix()), &res)
+	if len(res.Series) != 1 || len(res.Series[0].Samples) != 2 {
+		t.Fatalf("series = %+v", res.Series)
+	}
+	if res.Series[0].Samples[0].Value != 3 || res.Series[0].Samples[1].Value != 0 {
+		t.Errorf("samples = %v", res.Series[0].Samples)
+	}
+	traceQ := h.fake.find("_td = todatetime")
+	if !strings.Contains(traceQ, "| summarize _td = todatetime(max((_time + duration))) - todatetime(min(_time)) by trace_id") ||
+		!strings.Contains(traceQ, "| where _td > 2s") ||
+		!strings.Contains(traceQ, "| summarize _n = count(), _ids = make_list(trace_id, 5000)") {
+		t.Errorf("trace query:\n%s", traceQ)
+	}
+	if q := h.fake.find("summarize v = count()"); !strings.Contains(q, `where trace_id in ("`+traceA+`")`) {
+		t.Errorf("metrics query:\n%s", q)
+	}
+}
+
+// { rootServiceName = "web" && status = error } | rate() by (name): the
+// span-level conjunct narrows the aggregation and still filters spans.
+func TestMetricsRootServiceWithSpanFilter(t *testing.T) {
+	bucket := t0.Truncate(time.Minute)
+	h := newHarness(t, func(apl string) ([]axiom.Field, [][]any) {
+		switch {
+		case strings.Contains(apl, "_rs = ['service.name']"):
+			return traceIDTable(traceA)
+		case strings.Contains(apl, "| summarize by trace_id"):
+			return traceIDTable(traceA, traceB)
+		case strings.Contains(apl, "summarize v = count()"):
+			return fieldsOf("_bucket", "datetime", "g0", "string", "v", "integer"), [][]any{
+				{bucket.Format(time.RFC3339Nano), "POST /checkout", 120},
+			}
+		}
+		return defaultRespond(apl)
+	})
+	var res tempopb.QueryRangeResponse
+	q := url.QueryEscape(`{ rootServiceName = "web" && status = error } | rate() by (name)`)
+	h.getJSON(t, fmt.Sprintf("/api/metrics/query_range?q=%s&start=%d&end=%d&step=60",
+		q, bucket.Unix(), bucket.Add(time.Minute).Unix()), &res)
+	if len(res.Series) != 1 || res.Series[0].Samples[0].Value != 2 {
+		t.Fatalf("series = %+v", res.Series)
+	}
+	if res.Series[0].Labels[0].Key != "name" || res.Series[0].Labels[0].Value.GetStringValue() != "POST /checkout" {
+		t.Errorf("labels = %v", res.Series[0].Labels)
+	}
+	// The candidate query only keeps traces that hold an error span.
+	cand := h.fake.find("| summarize by trace_id")
+	if !strings.Contains(cand, `| where (['status.code'] =~ "error")`) {
+		t.Errorf("candidate query:\n%s", cand)
+	}
+	traceQ := h.fake.find("_rs = ['service.name']")
+	if !strings.Contains(traceQ, `| where trace_id in ("`+traceA+`", "`+traceB+`")`) ||
+		!strings.Contains(traceQ, "| summarize _r = arg_min(_rk, _rs) by trace_id") ||
+		!strings.Contains(traceQ, `| where _rs == "web"`) {
+		t.Errorf("trace query:\n%s", traceQ)
+	}
+	metricQ := h.fake.find("summarize v = count()")
+	if !strings.Contains(metricQ, `=~ "error")`) || !strings.Contains(metricQ, `and (trace_id in ("`+traceA+`"))`) {
+		t.Errorf("metrics query:\n%s", metricQ)
+	}
+}
+
+// { trace:rootName = "GET /x" } | quantile_over_time(duration, 0.9): a
+// root-only filter is narrowed by looking at root spans directly.
+func TestMetricsRootNameQuantile(t *testing.T) {
+	bucket := t0.Truncate(time.Minute)
+	h := newHarness(t, func(apl string) ([]axiom.Field, [][]any) {
+		switch {
+		case strings.Contains(apl, "isempty(parent_span_id)) and (name =="):
+			return traceIDTable(traceA, traceB)
+		case strings.Contains(apl, "_rn = name"):
+			return traceIDTable(traceA)
+		case strings.Contains(apl, "q0 = percentile("):
+			return fieldsOf("_bucket", "datetime", "q0", "float"), [][]any{
+				{bucket.Format(time.RFC3339Nano), 0.12},
+			}
+		}
+		return defaultRespond(apl)
+	})
+	var res tempopb.QueryRangeResponse
+	q := url.QueryEscape(`{ trace:rootName = "GET /cart" } | quantile_over_time(duration, 0.9)`)
+	h.getJSON(t, fmt.Sprintf("/api/metrics/query_range?q=%s&start=%d&end=%d&step=60",
+		q, bucket.Unix(), bucket.Add(time.Minute).Unix()), &res)
+	if len(res.Series) != 1 || res.Series[0].Samples[0].Value != 0.12 {
+		t.Fatalf("series = %+v", res.Series)
+	}
+	if res.Series[0].Labels[0].Key != "p" || res.Series[0].Labels[0].Value.GetDoubleValue() != 0.9 {
+		t.Errorf("labels = %v", res.Series[0].Labels)
+	}
+	cand := h.fake.find("isempty(parent_span_id)) and (name ==")
+	if !strings.Contains(cand, `| where (isempty(parent_span_id)) and (name == "GET /cart")`) {
+		t.Errorf("candidate query:\n%s", cand)
+	}
+	if q := h.fake.find("q0 = percentile("); !strings.Contains(q, `where trace_id in ("`+traceA+`")`) {
+		t.Errorf("metrics query:\n%s", q)
+	}
+}
+
+// Search keeps evaluating trace-level intrinsics in Tempo's engine, so a
+// trace-level search stays exact even though the prefilter cannot express
+// it.
+func TestSearchTraceIntrinsic(t *testing.T) {
+	h := newHarness(t, nil)
+	q := url.QueryEscape(`{ rootServiceName = "frontend" && traceDuration > 100ms }`)
+	var res map[string]any
+	h.getJSON(t, fmt.Sprintf("/api/search?q=%s&start=%d&end=%d&limit=20", q, t0.Add(-time.Hour).Unix(), t0.Add(time.Hour).Unix()), &res)
+	traces, _ := res["traces"].([]any)
+	if len(traces) != 1 {
+		t.Fatalf("traces = %v", res)
+	}
+	// Trace A lasts 120ms and roots in frontend; trace B lasts 5ms.
+	if traces[0].(map[string]any)["traceID"] != traceA {
+		t.Errorf("trace = %v", traces[0])
 	}
 }
 

@@ -58,9 +58,17 @@ func (e *Evaluator) compareAttributes() []compareAttr {
 // total series for both sets.
 func (e *Evaluator) evalCompare(ctx context.Context, mq *translate.MetricsQuery, req Request) ([]*series, error) {
 	m := e.tr.Mapping()
-	where, err := e.filterWhere(mq)
+	step := time.Duration(req.StepNs)
+	start := time.Unix(0, int64(req.StartNs))
+	end := time.Unix(0, int64(req.EndNs))
+	where, err := e.filterWhere(ctx, mq, start, end)
 	if err != nil {
 		return nil, err
+	}
+	if translate.SplitTrace(mq.Compare.Selection).Uses.Any() {
+		// The selection splits each bucket in two, so it has to be
+		// evaluable per span.
+		return nil, &UnsupportedError{Reason: "compare() selections cannot use trace-level intrinsics"}
 	}
 	sel := e.tr.Filter(mq.Compare.Selection)
 	if !sel.Exact {
@@ -80,9 +88,6 @@ func (e *Evaluator) evalCompare(ctx context.Context, mq *translate.MetricsQuery,
 		topN = maxCompareValuesDef
 	}
 
-	step := time.Duration(req.StepNs)
-	start := time.Unix(0, int64(req.StartNs))
-	end := time.Unix(0, int64(req.EndNs))
 	bucket := "_bucket = bin(" + m.Time().Expr + ", " + apl.Timespan(step) + ")"
 	selCol := "_sel = iff(" + selWhere + ", true, false)"
 

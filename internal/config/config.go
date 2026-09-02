@@ -54,6 +54,9 @@ type Config struct {
 	DefaultExemplars int
 	// MaxExemplars caps the exemplars per series a request may ask for.
 	MaxExemplars int
+	// MaxTraceIntrinsicTraces caps the traces a metrics query filtering
+	// on trace-level intrinsics may resolve to before it is refused.
+	MaxTraceIntrinsicTraces int
 	// TagSampleRows is how many rows are sampled to discover map keys.
 	TagSampleRows int
 	// DefaultLookback is the search window when the client omits one.
@@ -77,21 +80,22 @@ type Config struct {
 // Default returns the default configuration.
 func Default() Config {
 	return Config{
-		ListenAddr:        ":3200",
-		AxiomURL:          "https://api.axiom.co",
-		DatasetHeader:     "X-Axiom-Dataset",
-		SchemaRefresh:     5 * time.Minute,
-		MaxSearchTraces:   500,
-		MaxSpansPerFetch:  50000,
-		SearchBatchTraces: 400,
-		MaxTagValues:      5000,
-		DefaultExemplars:  100,
-		MaxExemplars:      1000,
-		TagSampleRows:     2000,
-		DefaultLookback:   time.Hour,
-		TraceLookback:     24 * time.Hour,
-		QueryTimeout:      60 * time.Second,
-		LogLevel:          "info",
+		ListenAddr:              ":3200",
+		AxiomURL:                "https://api.axiom.co",
+		DatasetHeader:           "X-Axiom-Dataset",
+		SchemaRefresh:           5 * time.Minute,
+		MaxSearchTraces:         500,
+		MaxSpansPerFetch:        50000,
+		SearchBatchTraces:       400,
+		MaxTagValues:            5000,
+		DefaultExemplars:        100,
+		MaxExemplars:            1000,
+		MaxTraceIntrinsicTraces: 5000,
+		TagSampleRows:           2000,
+		DefaultLookback:         time.Hour,
+		TraceLookback:           24 * time.Hour,
+		QueryTimeout:            60 * time.Second,
+		LogLevel:                "info",
 	}
 }
 
@@ -153,6 +157,7 @@ func Load(args []string) (Config, error) {
 		envInt("PROXY_MAX_TAG_VALUES", &c.MaxTagValues),
 		envInt("PROXY_DEFAULT_EXEMPLARS", &c.DefaultExemplars),
 		envInt("PROXY_MAX_EXEMPLARS", &c.MaxExemplars),
+		envInt("PROXY_MAX_TRACE_INTRINSIC_TRACES", &c.MaxTraceIntrinsicTraces),
 		envInt("PROXY_TAG_SAMPLE_ROWS", &c.TagSampleRows),
 	} {
 		if err != nil {
@@ -179,6 +184,7 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&c.MaxTagValues, "max-tag-values", c.MaxTagValues, "cap on tag values")
 	fs.IntVar(&c.DefaultExemplars, "default-exemplars", c.DefaultExemplars, "exemplars per series when the request does not ask for a number (0 disables)")
 	fs.IntVar(&c.MaxExemplars, "max-exemplars", c.MaxExemplars, "cap on exemplars per series")
+	fs.IntVar(&c.MaxTraceIntrinsicTraces, "max-trace-intrinsic-traces", c.MaxTraceIntrinsicTraces, "cap on traces a trace-level metrics filter may resolve to")
 	fs.IntVar(&c.TagSampleRows, "tag-sample-rows", c.TagSampleRows, "rows sampled to discover map keys")
 	if err := fs.Parse(args); err != nil {
 		return c, err
