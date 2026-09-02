@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -86,7 +87,13 @@ func parsePromDuration(v string) (time.Duration, error) {
 }
 
 func parseUint(r *http.Request, name string, def uint32) (uint32, error) {
-	v := r.URL.Query().Get(name)
+	return parseUintValue(r.URL.Query(), name, def)
+}
+
+// parseUintValue is parseUint over already-parsed query values, so the
+// metrics request builder can work without an *http.Request.
+func parseUintValue(q url.Values, name string, def uint32) (uint32, error) {
+	v := q.Get(name)
 	if v == "" {
 		return def, nil
 	}

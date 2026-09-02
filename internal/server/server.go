@@ -14,6 +14,11 @@ import (
 
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
+	"github.com/grafana/tempo/pkg/tempopb"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/velddev/axiom-tempo-proxy/internal/apl"
 	"github.com/velddev/axiom-tempo-proxy/internal/axiom"
@@ -33,6 +38,7 @@ type Server struct {
 	log     *slog.Logger
 	schemas *schemaCache
 	mux     *http.ServeMux
+	grpc    *grpc.Server
 }
 
 // New wires a Server.
@@ -50,12 +56,32 @@ func New(cfg config.Config, client *axiom.Client, log *slog.Logger) *Server {
 		},
 	}
 	s.routes()
+	s.grpc = grpc.NewServer(grpc.StreamInterceptor(s.logStream))
+	tempopb.RegisterStreamingQuerierServer(s.grpc, &streamingQuerier{s: s})
 	return s
 }
 
-// Handler returns the HTTP handler.
+// Handler returns the handler for the single listening port. gRPC calls
+// (HTTP/2 with an application/grpc content type) go to the StreamingQuerier
+// service, everything else to the Tempo HTTP API. h2c accepts cleartext
+// HTTP/2, both by prior knowledge (the connection preface Grafana's gRPC
+// client sends) and by an HTTP/1.1 upgrade, so one port speaks both.
 func (s *Server) Handler() http.Handler {
-	return s.logging(s.mux)
+	httpHandler := s.logging(s.mux)
+	mixed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isGRPCRequest(r) {
+			s.grpc.ServeHTTP(w, r)
+			return
+		}
+		httpHandler.ServeHTTP(w, r)
+	})
+	return h2c.NewHandler(mixed, &http2.Server{})
+}
+
+// isGRPCRequest reports whether a request is a gRPC call. Plain HTTP/1.1
+// requests never match, so the HTTP API behaves exactly as before.
+func isGRPCRequest(r *http.Request) bool {
+	return r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
 }
 
 // routes registers every Tempo endpoint twice: at the root, where the
@@ -95,7 +121,7 @@ func (s *Server) Warm(ctx context.Context) {
 	}
 }
 
-// dataset picks the dataset for a request: the URL prefix, then the
+// dataset picks the dataset for an HTTP request: the URL prefix, then the
 // dataset header, then the dataset query parameter, then the default.
 func (s *Server) dataset(r *http.Request) (string, error) {
 	candidates := []string{r.PathValue("dataset")}
@@ -103,18 +129,42 @@ func (s *Server) dataset(r *http.Request) (string, error) {
 		candidates = append(candidates, r.Header.Get(s.cfg.DatasetHeader))
 	}
 	candidates = append(candidates, r.URL.Query().Get("dataset"))
+	return s.pickDataset(candidates, fmt.Sprintf("no dataset: use a /{dataset}/api/... URL prefix, the %s header, or a ?dataset= parameter", s.cfg.DatasetHeader))
+}
+
+// grpcDataset picks the dataset for a gRPC call. A URL path prefix does
+// not survive the gRPC dial (Grafana dials host:port only), so the dataset
+// comes from the dataset header forwarded as metadata, a plain "dataset"
+// metadata key, or the configured default.
+func (s *Server) grpcDataset(ctx context.Context) (string, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	first := func(key string) string {
+		if key == "" {
+			return ""
+		}
+		if v := md.Get(key); len(v) > 0 {
+			return v[0]
+		}
+		return ""
+	}
+	candidates := []string{first(s.cfg.DatasetHeader), first("dataset")}
+	return s.pickDataset(candidates, fmt.Sprintf("no dataset: send the %s or dataset gRPC metadata key, or configure a default dataset (a URL path prefix does not reach gRPC)", s.cfg.DatasetHeader))
+}
+
+// pickDataset returns the first allowed candidate, else the default.
+func (s *Server) pickDataset(candidates []string, missingMsg string) (string, error) {
 	for _, v := range candidates {
 		v = strings.TrimSpace(v)
 		if v == "" {
 			continue
 		}
 		if !s.cfg.DatasetAllowed(v) {
-			return "", fmt.Errorf("dataset %q is not allowed", v)
+			return "", &statusError{status: http.StatusBadRequest, msg: fmt.Sprintf("dataset %q is not allowed", v)}
 		}
 		return v, nil
 	}
 	if s.cfg.Dataset == "" {
-		return "", fmt.Errorf("no dataset: use a /{dataset}/api/... URL prefix, the %s header, or a ?dataset= parameter", s.cfg.DatasetHeader)
+		return "", &statusError{status: http.StatusBadRequest, msg: missingMsg}
 	}
 	return s.cfg.Dataset, nil
 }
@@ -138,6 +188,20 @@ type datasetSchema struct {
 	discovered  bool
 	refreshing  bool
 	refreshLock sync.Mutex
+}
+
+// statusError is an error that already knows the HTTP status it maps to.
+// Request validation returns it so the HTTP handlers and the gRPC methods
+// can each render it in their own error space.
+type statusError struct {
+	status int
+	msg    string
+}
+
+func (e *statusError) Error() string { return e.msg }
+
+func badRequest(format string, args ...any) error {
+	return &statusError{status: http.StatusBadRequest, msg: fmt.Sprintf(format, args...)}
 }
 
 // DatasetError reports a dataset that cannot be queried at all.
@@ -382,31 +446,43 @@ func (s *Server) writeError(w http.ResponseWriter, status int, msg string) {
 	_, _ = fmt.Fprintln(w, msg)
 }
 
-// writeQueryError maps errors from the query path to HTTP statuses.
-func (s *Server) writeQueryError(w http.ResponseWriter, err error) {
+// queryErrorStatus maps an error from the query path to an HTTP status.
+func queryErrorStatus(err error) int {
+	var stErr *statusError
+	var dsErr *DatasetError
 	var apiErr *axiom.APIError
 	var unsupported *metrics.UnsupportedError
 	switch {
+	case errors.As(err, &stErr):
+		return stErr.status
+	case errors.As(err, &dsErr):
+		return http.StatusNotFound
 	case errors.As(err, &unsupported):
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		return http.StatusBadRequest
 	case errors.Is(err, translate.ErrUnsupported):
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		return http.StatusBadRequest
 	case errors.As(err, &apiErr):
-		status := http.StatusBadGateway
 		switch apiErr.Status {
 		case http.StatusBadRequest:
-			status = http.StatusBadRequest
-		case http.StatusUnauthorized, http.StatusForbidden:
-			status = http.StatusBadGateway
+			return http.StatusBadRequest
 		case http.StatusTooManyRequests:
-			status = http.StatusTooManyRequests
+			return http.StatusTooManyRequests
 		}
-		s.writeError(w, status, err.Error())
+		return http.StatusBadGateway
 	case errors.Is(err, context.DeadlineExceeded):
-		s.writeError(w, http.StatusGatewayTimeout, "query timed out")
-	default:
-		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return http.StatusGatewayTimeout
 	}
+	return http.StatusInternalServerError
+}
+
+// writeQueryError maps errors from the query path to HTTP statuses.
+func (s *Server) writeQueryError(w http.ResponseWriter, err error) {
+	status := queryErrorStatus(err)
+	if status == http.StatusGatewayTimeout {
+		s.writeError(w, status, "query timed out")
+		return
+	}
+	s.writeError(w, status, err.Error())
 }
 
 // logging is request logging middleware.
