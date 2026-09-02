@@ -136,7 +136,7 @@ v2 response:
 | `start`,`end` | unix seconds (<=10 digits), unix nanoseconds (>10 digits), fractional seconds, or RFC3339Nano | Defaults: `end=now`, `start=end-since` |
 | `since` | Prometheus duration | default 1h |
 | `step` | float seconds or Go duration | absent -> `DefaultQueryRangeStep`; negative -> 400. query_range only |
-| `exemplars` | uint32 | max exemplars; 0/absent = none |
+| `exemplars` | uint32 | max exemplars per series. Absent or `0` means *unspecified*, not none: `normalizeRequestExemplars` (`modules/frontend/metrics_query_range_handler.go`) then substitutes `max_exemplars` (config default 100) and caps at it. An integer `with(exemplars=N)` hint overrides the parameter, `with(exemplars=false)` forces 0, `with(exemplars=true)` is a no-op. Instant queries force 0. Grafana's datasource omits the parameter entirely (its UI input is commented out) and Drilldown never sets it, so both rely on that default. |
 | `maxSeries` | uint32 | cap |
 | others | | internal sharding; ignore |
 
@@ -279,7 +279,9 @@ Instant: `"series": [ { "labels": [...], "value": 42 } ]`. Sample timestamps are
 
 Special labels: `p` (float) per quantile from `quantile_over_time`; `__bucket` for `histogram_over_time` (bucket upper bound); `__meta_type` in `baseline|selection|baseline_total|selection_total` and `__meta_error="__too_many_values__"` for `compare()`.
 
-Grafana frames: one per series, fields `time` and value named by series name; name = single label's value if one label, else `{k1=v1, k2="v2"}` sorted. `histogram_over_time` gets heatmap visualization. Exemplars -> frame `exemplar` with `Time`, `Value`, `traceId` (from label `trace:id`) plus one column per series label; exemplars with `value == 0` or `timestampMs <= 0` are dropped.
+Grafana frames: one per series, fields `time` and value named by series name; name = single label's value if one label, else `{k1=v1, k2="v2"}` sorted. `histogram_over_time` gets heatmap visualization. Exemplars -> frame named `exemplar` on `DataTopic.Annotations` with `Time`, `Value`, `traceId` (from label `trace:id`, surrounding quotes stripped) plus one string column per series label; exemplars with `value == 0` or `timestampMs <= 0` are dropped (NaN survives). Traces Drilldown's `exemplarsTransformations` finds the `traceId` field and hangs a "View trace" data link on it.
+
+Exemplar semantics in Tempo (`pkg/traceql/ast_metrics.go`, `engine_metrics.go`): `timestampMs` is the span's **start time**, not the bucket start. Values are per-function: `rate()`, `count_over_time()`, and `histogram_over_time()` produce NaN placeholders that `combiner.attachExemplars` replaces with the series' own sample value in the matching interval; `min/max/avg/sum_over_time(attr)` and `quantile_over_time(attr, ...)` carry the span's real value, in seconds for `duration`. A `quantile_over_time` exemplar is attached to exactly one quantile series, the one closest to it by value. An exemplar is dropped if the series value at its interval is NaN. Labels are all the span's materialized attributes; `trace:id` is there because `ExemplarMetaConditions` selects it.
 
 ## 5. TraceQL grammar
 

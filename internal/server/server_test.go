@@ -583,12 +583,13 @@ func TestTagValuesV2(t *testing.T) {
 func TestMetricsRateBy(t *testing.T) {
 	bucket := t0.Truncate(time.Minute)
 	h := newHarness(t, func(apl string) ([]axiom.Field, [][]any) {
-		if strings.Contains(apl, "summarize v = count() by _bucket = bin(_time, 1m), g0 = ['service.name']") {
-			return fieldsOf("_bucket", "datetime", "g0", "string", "v", "integer"), [][]any{
-				{bucket.Format(time.RFC3339Nano), "frontend", 120},
-				{bucket.Format(time.RFC3339Nano), "backend", 60},
-				{bucket.Add(time.Minute).Format(time.RFC3339Nano), "frontend", 240},
-			}
+		if strings.Contains(apl, "by _bucket = bin(_time, 1m), g0 = ['service.name']") {
+			return fieldsOf("_bucket", "datetime", "g0", "string", "v", "integer",
+					"_exv", "float", "_exid", "string", "_exts", "datetime"), [][]any{
+					{bucket.Format(time.RFC3339Nano), "frontend", 120, 0.12, traceA, bucket.Add(10 * time.Second).Format(time.RFC3339Nano)},
+					{bucket.Format(time.RFC3339Nano), "backend", 60, 0.08, traceB, bucket.Add(20 * time.Second).Format(time.RFC3339Nano)},
+					{bucket.Add(time.Minute).Format(time.RFC3339Nano), "frontend", 240, 0.05, traceB, bucket.Add(70 * time.Second).Format(time.RFC3339Nano)},
+				}
 		}
 		return defaultRespond(apl)
 	})
@@ -621,6 +622,30 @@ func TestMetricsRateBy(t *testing.T) {
 	apl := h.fake.find("summarize v = count()")
 	if !strings.Contains(apl, "where isempty(parent_span_id)") && !strings.Contains(apl, "(isempty(parent_span_id)) and (isnotnull(['service.name']))") {
 		t.Errorf("metrics query:\n%s", apl)
+	}
+	// Exemplars come out of the same summarize: one span per bucket per
+	// series, picked by arg_max so it is the slowest trace in the bucket.
+	if !strings.Contains(apl, "| extend _exid = trace_id, _exts = _time") ||
+		!strings.Contains(apl, "_exv = arg_max(coalesce(toreal(duration / 1s), 0.0), _exid, _exts)") {
+		t.Errorf("exemplar aggregation missing:\n%s", apl)
+	}
+	// rate() has no per-span value, so the exemplar carries the bucket's
+	// own rate, as Tempo's frontend fills in for its NaN placeholders.
+	if len(fe.Exemplars) != 2 {
+		t.Fatalf("frontend exemplars = %v", fe.Exemplars)
+	}
+	x := fe.Exemplars[0]
+	if len(x.Labels) != 1 || x.Labels[0].Key != "trace:id" || x.Labels[0].Value.GetStringValue() != traceA {
+		t.Errorf("exemplar labels = %v", x.Labels)
+	}
+	if x.Value != 2 || x.TimestampMs != bucket.Add(10*time.Second).UnixMilli() {
+		t.Errorf("exemplar = %+v", x)
+	}
+	if fe.Exemplars[1].Value != 4 || fe.Exemplars[1].TimestampMs != bucket.Add(70*time.Second).UnixMilli() {
+		t.Errorf("second exemplar = %+v", fe.Exemplars[1])
+	}
+	if len(be.Exemplars) != 1 || be.Exemplars[0].Labels[0].Value.GetStringValue() != traceB || be.Exemplars[0].Value != 1 {
+		t.Errorf("backend exemplars = %v", be.Exemplars)
 	}
 }
 
@@ -715,6 +740,16 @@ func TestMetricsCompare(t *testing.T) {
 	sel := h.fake.find("_sel = iff(")
 	if !strings.Contains(sel, `iff((['status.code'] =~ "error")`) {
 		t.Errorf("compare query:\n%s", sel)
+	}
+	// compare() series are synthetic baseline/selection counts, so they
+	// carry no exemplars and the queries do not aggregate any.
+	if strings.Contains(sel, "arg_max") {
+		t.Errorf("compare must not aggregate exemplars:\n%s", sel)
+	}
+	for _, s := range res.Series {
+		if len(s.Exemplars) != 0 {
+			t.Errorf("compare series %v has exemplars %v", s.Labels, s.Exemplars)
+		}
 	}
 }
 

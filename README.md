@@ -42,6 +42,17 @@ search, tag autocomplete, and the RED metrics panels.
   than that are only matched on their first eight.
 - **Metrics** are translated to native APL `summarize ... by bin(_time, step)`
   aggregations, so they scale with Axiom rather than with the proxy.
+- **Exemplars** (the clickable trace dots on RED and breakdown panels)
+  come out of that same `summarize`: an `arg_max`/`arg_min` picks one
+  span per bucket per series, so no extra query is issued. The exemplar
+  carries a `trace:id` label, the span's own start time, and the value
+  Tempo would report — the span's value in seconds for `min/max/avg/
+  sum/quantile_over_time(duration)`, and the bucket's own value for
+  `rate`, `count_over_time`, and `histogram_over_time`. `compare()` and
+  instant queries carry none, as in Tempo. Neither Grafana nor Traces
+  Drilldown sends the `exemplars` parameter, so the count falls back to
+  `PROXY_DEFAULT_EXEMPLARS`; `with(exemplars=N)` and
+  `with(exemplars=false)` in the query override it.
 - The dataset's field list is discovered at startup (and refreshed) so
   attributes that Axiom flattens (`attributes.http.method`) and attributes
   kept in the `attributes.custom` map are both addressed correctly.
@@ -90,6 +101,8 @@ token can read is accepted.
 | `PROXY_MAX_SEARCH_TRACES` | `-max-search-traces` | `500` | cap on candidate traces per search |
 | `PROXY_MAX_SPANS_PER_FETCH` | `-max-spans-per-fetch` | `50000` | cap on spans pulled per query |
 | `PROXY_MAX_TAG_VALUES` | `-max-tag-values` | `5000` | cap on tag values |
+| `PROXY_DEFAULT_EXEMPLARS` | `-default-exemplars` | `100` | exemplars per series when the request names no number (`0` disables) |
+| `PROXY_MAX_EXEMPLARS` | `-max-exemplars` | `1000` | cap on exemplars per series |
 | `PROXY_SCHEMA_REFRESH` | `-schema-refresh` | `5m` | schema re-discovery interval |
 | `PROXY_QUERY_TIMEOUT` | `-query-timeout` | `60s` | per-request timeout |
 | `PROXY_LOG_QUERIES` | `-log-queries` | `false` | log every generated APL query |

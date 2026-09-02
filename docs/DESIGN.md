@@ -51,6 +51,27 @@ and rendered as `summarize ... by bin(_time, step), <by attrs>`. The spanset
 filter must translate exactly; otherwise the request fails with a clear
 error rather than returning wrong numbers.
 
+**Exemplars.** They ride along on that same query rather than costing a
+second one. The trace id and timestamp are aliased first (`extend
+_exid = trace_id, _exts = _time`, because `arg_max` names its extra
+result columns after the columns it is given and `_time` would collide
+with the `bin()` grouping key), and an `_exv = arg_max(<value>, _exid,
+_exts)` aggregation is appended to the `summarize`. That yields one span
+per bucket per series: the extremum for the `*_over_time` functions
+(`arg_min` for `min_over_time`, so the exemplar is the span the series
+value reports) and the slowest span in the bucket for the counting
+functions, which have no per-span value; `coalesce(..., 0.0)` keeps a
+trace id even for buckets whose spans all lack a duration. Values follow
+Tempo: the span's own value in seconds for the attribute functions, the
+bucket's sample value for `rate`, `count_over_time`, and
+`histogram_over_time` (Tempo emits NaN placeholders for those and fills
+them in the query frontend the same way). For `quantile_over_time` the
+exemplar goes to the one quantile series closest to it by value, as
+Tempo's `assignExemplarToQuantile` does. `compare()` and instant queries
+carry none. The result is thinned to an evenly spread subset of the
+requested count, and exemplars Grafana would discard (value 0, or a
+non-positive timestamp) are never emitted.
+
 **Tags and tag values.** Tag names come from the dataset field list
 (flattened `attributes.*`/`resource.*` fields) plus keys sampled from the
 `attributes.custom`/`resource.custom` map fields. Tag values run

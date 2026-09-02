@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 // Tempo's internal series labels.
 const (
 	LabelP              = "p"
+	LabelTraceID        = "trace:id"
 	LabelBucket         = "__bucket"
 	LabelMetaType       = "__meta_type"
 	LabelMetaError      = "__meta_error"
@@ -53,8 +55,13 @@ type Options struct {
 	MaxCompareAttributes int
 	// CompareConcurrency bounds parallel compare() queries.
 	CompareConcurrency int
-	Log                *slog.Logger
-	LogQueries         bool
+	// DefaultExemplars is used when a request asks for no particular
+	// number, as Tempo's max_exemplars is.
+	DefaultExemplars int
+	// MaxExemplars caps the exemplars returned per series.
+	MaxExemplars int
+	Log          *slog.Logger
+	LogQueries   bool
 }
 
 func (o Options) withDefaults() Options {
@@ -66,6 +73,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.CompareConcurrency <= 0 {
 		o.CompareConcurrency = 4
+	}
+	if o.MaxExemplars <= 0 {
+		o.MaxExemplars = 1000
+	}
+	if o.DefaultExemplars < 0 {
+		o.DefaultExemplars = 0
 	}
 	if o.Log == nil {
 		o.Log = slog.Default()
@@ -79,6 +92,12 @@ type Request struct {
 	StartNs uint64
 	EndNs   uint64
 	StepNs  uint64
+	// Exemplars is the request's `exemplars` parameter: how many
+	// exemplars to return per series. Zero means "unspecified" and falls
+	// back to Options.DefaultExemplars, exactly as Tempo's
+	// normalizeRequestExemplars does. A with(exemplars=...) hint in the
+	// query overrides it.
+	Exemplars int
 }
 
 // Evaluator runs metrics queries.
@@ -93,10 +112,32 @@ func New(client *axiom.Client, tr *translate.Translator, opts Options) *Evaluato
 	return &Evaluator{client: client, tr: tr, opts: opts.withDefaults()}
 }
 
+// exemplar is one trace pinned to a bucket of a series.
+type exemplar struct {
+	traceID string
+	value   float64
+	tsMs    int64
+}
+
 // series is an intermediate time series keyed by its labels.
 type series struct {
 	labels  []*common.KeyValue
 	samples map[int64]float64 // bucket start ms -> value
+	// exemplars holds at most one exemplar per bucket, keyed the same way
+	// as samples so second-stage filtering can drop them together.
+	exemplars map[int64]exemplar
+}
+
+func (s *series) addExemplar(bucketMs int64, ex exemplar) {
+	if ex.traceID == "" || ex.tsMs <= 0 || ex.value == 0 {
+		// Grafana's Tempo datasource drops exemplars with value 0 or a
+		// non-positive timestamp, so never emit them.
+		return
+	}
+	if s.exemplars == nil {
+		s.exemplars = map[int64]exemplar{}
+	}
+	s.exemplars[bucketMs] = ex
 }
 
 func (s *series) key() string { return labelsKey(s.labels) }
@@ -111,11 +152,20 @@ func labelsKey(labels []*common.KeyValue) string {
 
 // QueryRange evaluates a metrics query over a time range.
 func (e *Evaluator) QueryRange(ctx context.Context, req Request) (*tempopb.QueryRangeResponse, error) {
+	return e.queryRange(ctx, req, true)
+}
+
+func (e *Evaluator) queryRange(ctx context.Context, req Request, exemplars bool) (*tempopb.QueryRangeResponse, error) {
 	mq, err := translate.ParseMetrics(req.Query)
 	if err != nil {
 		return nil, err
 	}
 	req.StartNs, req.EndNs, req.StepNs = align(req.StartNs, req.EndNs, req.StepNs)
+	if exemplars {
+		req.Exemplars = e.exemplarCount(mq, req.Exemplars)
+	} else {
+		req.Exemplars = 0
+	}
 
 	out, err := e.eval(ctx, mq, req)
 	if err != nil {
@@ -124,13 +174,38 @@ func (e *Evaluator) QueryRange(ctx context.Context, req Request) (*tempopb.Query
 	return e.render(out, req), nil
 }
 
+// exemplarCount resolves how many exemplars per series to produce,
+// mirroring Tempo's normalizeRequestExemplars: an integer
+// with(exemplars=N) hint wins, with(exemplars=false) disables them, and
+// a request that names no number gets the configured default. Note that
+// with(exemplars=true) is a no-op in Tempo, and that an explicit
+// exemplars=0 means "unspecified", not "none".
+func (e *Evaluator) exemplarCount(mq *translate.MetricsQuery, requested int) int {
+	hint := strings.ToLower(strings.TrimSpace(mq.Hints["exemplars"]))
+	n, notInt := strconv.Atoi(hint)
+	switch {
+	case notInt == nil:
+		requested = max(n, 0)
+	case hint == "false":
+		requested = 0
+	case requested <= 0:
+		requested = e.opts.DefaultExemplars
+	}
+	if requested < 0 {
+		return 0
+	}
+	return min(requested, e.opts.MaxExemplars)
+}
+
 // QueryInstant evaluates a metrics query as a single bucket.
 func (e *Evaluator) QueryInstant(ctx context.Context, req Request) (*tempopb.QueryInstantResponse, error) {
 	req.StepNs = req.EndNs - req.StartNs
 	if req.StepNs == 0 {
 		req.StepNs = 1
 	}
-	rr, err := e.QueryRange(ctx, req)
+	// InstantSeries has no exemplars, and Tempo forces exemplars off for
+	// instant queries, so do not pay for the aggregation.
+	rr, err := e.queryRange(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -288,6 +363,106 @@ func (e *Evaluator) valueExpr(a traceql.Attribute) (string, bool, error) {
 	return "toreal(" + col.Expr + ")", false, nil
 }
 
+// exemplarAggregation describes the extra summarize aggregation that
+// pins one exemplar span to every bucket of every series.
+type exemplarAggregation struct {
+	ok bool
+	// extends are the extend assignments the aggregation reads.
+	extends []string
+	// agg is the arg_max/arg_min aggregation itself. arg_max(expr, a, b)
+	// returns a and b as columns under their own names, so the chosen
+	// span comes back as _exid/_exts and its value as _exv.
+	agg string
+	// spanValue is true when the exemplar's value is the chosen span's
+	// own value (_exv) rather than the bucket's sample value. Tempo uses
+	// the span value for the *_over_time functions that take an
+	// attribute, and a placeholder later filled with the sample value
+	// for the counting functions (rate, count_over_time,
+	// histogram_over_time).
+	spanValue bool
+}
+
+// exemplarAgg builds the exemplar aggregation for a metrics function.
+// valExpr is the numeric expression the metric aggregates over, empty for
+// the counting functions.
+func (e *Evaluator) exemplarAgg(fn translate.MetricsFunc, valExpr string, want int) exemplarAggregation {
+	if want <= 0 {
+		return exemplarAggregation{}
+	}
+	m := e.tr.Mapping()
+	id, ts := m.TraceID(), m.Time()
+	if id.Missing || ts.Missing {
+		return exemplarAggregation{}
+	}
+	// The trace id and timestamp are aliased first: arg_max names its
+	// extra result columns after the columns it is given, and _time
+	// collides with the bin() grouping key.
+	out := exemplarAggregation{ok: true, extends: []string{"_exid = " + id.Expr, "_exts = " + ts.Expr}}
+	switch fn {
+	case translate.FuncRate, translate.FuncCountOverTime, translate.FuncHistogramOverTime:
+		// These have no per-span value, so any span in the bucket is a
+		// valid exemplar. Prefer the slowest one as the most interesting
+		// trace to open; coalesce keeps a trace id even for buckets whose
+		// spans all lack a duration.
+		order := "_exts"
+		if d := m.Duration(); !d.Missing {
+			order = "coalesce(toreal(" + d.Expr + " / 1s), 0.0)"
+		}
+		out.agg = "_exv = arg_max(" + order + ", _exid, _exts)"
+	case translate.FuncMinOverTime:
+		// So the exemplar is the span the series value reports.
+		out.agg = "_exv = arg_min(" + valExpr + ", _exid, _exts)"
+		out.spanValue = true
+	default:
+		out.agg = "_exv = arg_max(" + valExpr + ", _exid, _exts)"
+		out.spanValue = true
+	}
+	return out
+}
+
+// read pulls the exemplar of one summarize row. sample is the bucket's
+// own value, used when the function has no per-span value.
+func (x exemplarAggregation) read(row axiom.Row, bucketMs int64, sample float64) (exemplar, bool) {
+	if !x.ok {
+		return exemplar{}, false
+	}
+	id, ok := traceIDHex(row.String("_exid"))
+	if !ok {
+		return exemplar{}, false
+	}
+	// Tempo timestamps an exemplar with the span's own start time, not
+	// the bucket start.
+	tsMs := bucketMs
+	if t := row.Time("_exts"); !t.IsZero() {
+		tsMs = t.UnixMilli()
+	}
+	v := sample
+	if x.spanValue {
+		if v, ok = row.TryFloat64("_exv"); !ok {
+			return exemplar{}, false
+		}
+	}
+	return exemplar{traceID: id, value: v, tsMs: tsMs}, true
+}
+
+// traceIDHex normalises a dataset trace id to the 32 lowercase hex
+// characters Tempo and Grafana expect, rejecting anything else.
+func traceIDHex(s string) (string, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" || len(s) > 32 {
+		return "", false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	if len(s) < 32 {
+		s = strings.Repeat("0", 32-len(s)) + s
+	}
+	return s, true
+}
+
 func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuery, req Request) ([]*series, error) {
 	m := e.tr.Mapping()
 	where, err := e.filterWhere(mq)
@@ -310,6 +485,7 @@ func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuer
 	}
 
 	var isDuration bool
+	var valExpr string
 	switch mq.Func {
 	case translate.FuncRate, translate.FuncCountOverTime:
 		aggs = []string{"v = count()"}
@@ -318,7 +494,7 @@ func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuer
 		if err != nil {
 			return nil, err
 		}
-		isDuration = dur
+		isDuration, valExpr = dur, expr
 		fn := map[translate.MetricsFunc]string{
 			translate.FuncMinOverTime: "min", translate.FuncMaxOverTime: "max",
 			translate.FuncAvgOverTime: "avg", translate.FuncSumOverTime: "sum",
@@ -330,7 +506,7 @@ func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuer
 		if err != nil {
 			return nil, err
 		}
-		isDuration = dur
+		isDuration, valExpr = dur, expr
 		q.Where(apl.Call("isnotnull", expr))
 		for i, qt := range mq.Quantiles {
 			aggs = append(aggs, fmt.Sprintf("q%d = percentile(%s, %s)", i, expr, apl.Float(qt*100)))
@@ -355,6 +531,12 @@ func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuer
 		return nil, &UnsupportedError{Reason: "function " + string(mq.Func)}
 	}
 	_ = isDuration
+
+	ex := e.exemplarAgg(mq.Func, valExpr, req.Exemplars)
+	if ex.ok {
+		q.Extend(ex.extends...)
+		aggs = append(aggs, ex.agg)
+	}
 
 	q.Summarize(aggs, byCols)
 	q.Sort("_bucket asc")
@@ -392,17 +574,45 @@ func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuer
 			if !ok {
 				continue
 			}
+			// attach records the exemplar of this row on a series once its
+			// sample value is known.
+			attach := func(s *series, sample float64) {
+				if x, ok := ex.read(row, tsMs, sample); ok {
+					s.addExemplar(tsMs, x)
+				}
+			}
 			switch mq.Func {
 			case translate.FuncRate:
-				get(labels).samples[tsMs] = row.Float64("v") / stepSeconds
+				v := row.Float64("v") / stepSeconds
+				s := get(labels)
+				s.samples[tsMs] = v
+				attach(s, v)
 			case translate.FuncQuantileOverTime:
+				// Tempo attaches an exemplar to exactly one quantile
+				// series: the one whose value it is closest to.
+				best, bestDist := -1, math.Inf(1)
+				for i := range mq.Quantiles {
+					v, ok := row.TryFloat64(fmt.Sprintf("q%d", i))
+					if !ok {
+						continue
+					}
+					if x, ok := ex.read(row, tsMs, v); ok {
+						if d := math.Abs(x.value - v); d < bestDist {
+							best, bestDist = i, d
+						}
+					}
+				}
 				for i, qt := range mq.Quantiles {
 					v, ok := row.TryFloat64(fmt.Sprintf("q%d", i))
 					if !ok {
 						continue
 					}
 					l := append(append([]*common.KeyValue{}, labels...), &common.KeyValue{Key: LabelP, Value: traceql.NewStaticFloat(qt).AsAnyValue()})
-					get(l).samples[tsMs] = v
+					s := get(l)
+					s.samples[tsMs] = v
+					if i == best {
+						attach(s, v)
+					}
 				}
 			case translate.FuncHistogramOverTime:
 				bucket, ok := row.TryFloat64("_bucketv")
@@ -417,11 +627,16 @@ func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuer
 					bv = traceql.NewStaticFloat(bucket)
 				}
 				l := append(append([]*common.KeyValue{}, labels...), &common.KeyValue{Key: LabelBucket, Value: bv.AsAnyValue()})
-				get(l).samples[tsMs] = row.Float64("v")
+				v := row.Float64("v")
+				s := get(l)
+				s.samples[tsMs] = v
+				attach(s, v)
 			default:
 				v, ok := row.TryFloat64("v")
 				if ok {
-					get(labels).samples[tsMs] = v
+					s := get(labels)
+					s.samples[tsMs] = v
+					attach(s, v)
 				}
 			}
 		}
@@ -549,6 +764,11 @@ func applySecondStage(in []*series, st translate.SecondStage) []*series {
 					filtered.samples[ts] = v
 				}
 			}
+			for ts, x := range s.exemplars {
+				if keep[i][ts] {
+					filtered.addExemplar(ts, x)
+				}
+			}
 			out = append(out, filtered)
 		}
 		return out
@@ -576,6 +796,11 @@ func applySecondStage(in []*series, st translate.SecondStage) []*series {
 		for ts, v := range s.samples {
 			if cmp(v) {
 				filtered.samples[ts] = v
+			}
+		}
+		for ts, x := range s.exemplars {
+			if _, ok := filtered.samples[ts]; ok {
+				filtered.addExemplar(ts, x)
 			}
 		}
 		if len(filtered.samples) > 0 {
@@ -610,9 +835,44 @@ func (e *Evaluator) render(in []*series, req Request) *tempopb.QueryRangeRespons
 			}
 			ts.Samples = append(ts.Samples, tempopb.Sample{TimestampMs: k, Value: v})
 		}
+		ts.Exemplars = renderExemplars(s, req.Exemplars)
 		res.Series = append(res.Series, ts)
 	}
 	return res
+}
+
+// renderExemplars turns a series' per-bucket exemplars into Tempo's wire
+// form, oldest first, thinned to at most want of them by keeping an
+// evenly spread subset so the dots still cover the whole range.
+func renderExemplars(s *series, want int) []tempopb.Exemplar {
+	if want <= 0 || len(s.exemplars) == 0 {
+		return nil
+	}
+	keys := make([]int64, 0, len(s.exemplars))
+	for k := range s.exemplars {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(a, b int) bool { return keys[a] < keys[b] })
+	if len(keys) > want {
+		thinned := make([]int64, 0, want)
+		for i := range want {
+			thinned = append(thinned, keys[i*len(keys)/want])
+		}
+		keys = thinned
+	}
+	out := make([]tempopb.Exemplar, 0, len(keys))
+	for _, k := range keys {
+		x := s.exemplars[k]
+		if math.IsNaN(x.value) || math.IsInf(x.value, 0) {
+			continue
+		}
+		out = append(out, tempopb.Exemplar{
+			Labels:      []common.KeyValue{{Key: LabelTraceID, Value: traceql.NewStaticString(x.traceID).AsAnyValue()}},
+			Value:       x.value,
+			TimestampMs: x.tsMs,
+		})
+	}
+	return out
 }
 
 func (e *Evaluator) run(ctx context.Context, query string, start, end time.Time) (*axiom.Result, error) {
