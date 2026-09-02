@@ -83,7 +83,7 @@ func Default() Config {
 		SchemaRefresh:     5 * time.Minute,
 		MaxSearchTraces:   500,
 		MaxSpansPerFetch:  50000,
-		SearchBatchTraces: 50,
+		SearchBatchTraces: 400,
 		MaxTagValues:      5000,
 		DefaultExemplars:  100,
 		MaxExemplars:      1000,

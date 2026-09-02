@@ -149,7 +149,7 @@ calls keep accepting the URL prefix and the `?dataset=` parameter.
 | `PROXY_TRACE_LOOKBACK` | `-trace-lookback` | `24h` | trace-by-id window when none is given |
 | `PROXY_MAX_SEARCH_TRACES` | `-max-search-traces` | `500` | cap on candidate traces per search |
 | `PROXY_MAX_SPANS_PER_FETCH` | `-max-spans-per-fetch` | `50000` | span budget for one search (across its batches) or one trace |
-| `PROXY_SEARCH_BATCH_TRACES` | `-search-batch-traces` | `50` | candidate traces per span-pull query during a search |
+| `PROXY_SEARCH_BATCH_TRACES` | `-search-batch-traces` | `400` | candidate traces per span-pull query during a search |
 | `PROXY_MAX_TAG_VALUES` | `-max-tag-values` | `5000` | cap on tag values |
 | `PROXY_DEFAULT_EXEMPLARS` | `-default-exemplars` | `100` | exemplars per series when the request names no number (`0` disables) |
 | `PROXY_MAX_EXEMPLARS` | `-max-exemplars` | `1000` | cap on exemplars per series |
