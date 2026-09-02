@@ -25,6 +25,11 @@ import (
 
 var hexRe = regexp.MustCompile(`^[0-9A-Fa-f]+$`)
 
+// droppedTracesMetric is the SearchMetrics.AdditionalMetrics key naming
+// candidate traces left out of a search because their spans could not be
+// fetched completely.
+const droppedTracesMetric = "droppedTraces"
+
 // intrinsicTags is what Tempo lists under the intrinsic scope.
 var intrinsicTags = []string{
 	"duration", "event:name", "event:timeSinceStart", "instrumentation:name", "instrumentation:version",
@@ -73,6 +78,7 @@ func (s *Server) fetchOptions(ds *datasetSchema) fetch.Options {
 		Dataset:          ds.name,
 		MaxTraces:        s.cfg.MaxSearchTraces,
 		MaxSpans:         s.cfg.MaxSpansPerFetch,
+		BatchTraces:      s.cfg.SearchBatchTraces,
 		DefaultLookback:  s.cfg.DefaultLookback,
 		TracePadding:     time.Hour,
 		NoPreferSelected: s.cfg.NoPreferSelected,
@@ -114,7 +120,7 @@ func (s *Server) handleTraceByID(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cancel()
 
-	trace, err := fetch.FetchTrace(ctx, s.client, ds.translator, s.fetchOptions(ds), id, start, end)
+	trace, st, err := fetch.FetchTrace(ctx, s.client, ds.translator, s.fetchOptions(ds), id, start, end)
 	if err != nil {
 		s.writeQueryError(w, err)
 		return
@@ -125,8 +131,18 @@ func (s *Server) handleTraceByID(w http.ResponseWriter, r *http.Request) {
 	}
 	otlp := convert.ToOTLP(trace)
 	if isV2(r) {
-		s.writeMessage(w, r, &tempopb.TraceByIDResponse{Trace: otlp, Metrics: &tempopb.TraceByIDMetrics{}}, false)
+		res := &tempopb.TraceByIDResponse{Trace: otlp, Metrics: &tempopb.TraceByIDMetrics{}}
+		// v1 has no status field, so an incomplete trace can only be
+		// reported on v2.
+		if st.Partial {
+			res.Status = tempopb.PartialStatus_PARTIAL
+			res.Message = st.Message
+		}
+		s.writeMessage(w, r, res, false)
 		return
+	}
+	if st.Partial {
+		s.log.Warn("trace returned incomplete", "trace", id, "reason", st.Message)
 	}
 	s.writeMessage(w, r, otlp, true)
 }
@@ -249,9 +265,23 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			tr.TraceID = strings.Repeat("0", 32-n) + tr.TraceID
 		}
 	}
+	stats := fetcher.Stats()
 	res.Metrics.CompletedJobs, res.Metrics.TotalJobs = 1, 1
-	res.Metrics.InspectedTraces = uint32(fetcher.Stats().CandidateTraces)
-	res.Metrics.InspectedSpans = uint64(fetcher.Stats().SpansFetched)
+	res.Metrics.InspectedTraces = uint32(stats.CandidateTraces)
+	res.Metrics.InspectedSpans = uint64(stats.SpansFetched)
+	// SearchResponse has no status field, so a truncated span pull is
+	// reported as an additional metric (and logged) instead of silently
+	// returning fewer traces.
+	if stats.DroppedTraces > 0 {
+		if res.Metrics.AdditionalMetrics == nil {
+			res.Metrics.AdditionalMetrics = map[string]int64{}
+		}
+		res.Metrics.AdditionalMetrics[droppedTracesMetric] = int64(stats.DroppedTraces)
+		s.log.Warn("search result incomplete: span budget exhausted",
+			"query", query, "droppedTraces", stats.DroppedTraces,
+			"candidateTraces", stats.CandidateTraces, "spansFetched", stats.SpansFetched,
+			"maxSpansPerFetch", s.cfg.MaxSpansPerFetch)
+	}
 	s.writeMessage(w, r, res, false)
 }
 

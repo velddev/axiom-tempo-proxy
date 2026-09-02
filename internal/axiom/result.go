@@ -31,6 +31,28 @@ type Status struct {
 	Messages       []StatusMessage `json:"messages"`
 }
 
+// Warnings renders the status messages as text a caller can show, in
+// order and without duplicates. Empty messages are skipped.
+func (s Status) Warnings() []string {
+	out := make([]string, 0, len(s.Messages))
+	seen := make(map[string]bool, len(s.Messages))
+	for _, m := range s.Messages {
+		text := strings.TrimSpace(m.Msg)
+		if text == "" {
+			text = strings.TrimSpace(m.Code)
+		}
+		if text == "" || seen[text] {
+			continue
+		}
+		seen[text] = true
+		if m.Count > 1 {
+			text = fmt.Sprintf("%s (x%d)", text, m.Count)
+		}
+		out = append(out, text)
+	}
+	return out
+}
+
 // StatusMessage is a warning or notice attached to a query result.
 type StatusMessage struct {
 	Code     string `json:"code"`

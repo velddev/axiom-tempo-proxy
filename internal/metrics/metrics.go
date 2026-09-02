@@ -11,6 +11,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -81,11 +82,18 @@ type Request struct {
 	StepNs  uint64
 }
 
-// Evaluator runs metrics queries.
+// Evaluator runs metrics queries. One Evaluator serves one request: it
+// accumulates the partial-result status of every Axiom query it runs so
+// the response can say that the numbers are incomplete.
 type Evaluator struct {
 	client *axiom.Client
 	tr     *translate.Translator
 	opts   Options
+
+	mu       sync.Mutex
+	partial  bool
+	warnings []string
+	seen     map[string]bool
 }
 
 // New creates an Evaluator.
@@ -121,7 +129,52 @@ func (e *Evaluator) QueryRange(ctx context.Context, req Request) (*tempopb.Query
 	if err != nil {
 		return nil, err
 	}
-	return e.render(out, req), nil
+	res := e.render(out, req)
+	e.applyStatus(res)
+	return res, nil
+}
+
+// note records the partial-result status of one Axiom result.
+func (e *Evaluator) note(res *axiom.Result) {
+	if res == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if res.Status.IsPartial {
+		e.partial = true
+	}
+	for _, w := range res.Status.Warnings() {
+		if e.seen[w] {
+			continue
+		}
+		if e.seen == nil {
+			e.seen = map[string]bool{}
+		}
+		e.seen[w] = true
+		e.warnings = append(e.warnings, w)
+	}
+}
+
+// applyStatus stamps Axiom's partial-result status and status messages
+// onto the response, keeping any message render already set.
+func (e *Evaluator) applyStatus(res *tempopb.QueryRangeResponse) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.partial && len(e.warnings) == 0 {
+		return
+	}
+	var parts []string
+	if res.Message != "" {
+		parts = append(parts, res.Message)
+	}
+	if e.partial {
+		res.Status = tempopb.PartialStatus_PARTIAL
+		parts = append(parts, "axiom returned partial results")
+	}
+	parts = append(parts, e.warnings...)
+	res.Message = strings.Join(parts, "; ")
+	e.opts.Log.Warn("metrics query returned partial results", "partial", e.partial, "message", res.Message)
 }
 
 // QueryInstant evaluates a metrics query as a single bucket.
@@ -134,7 +187,7 @@ func (e *Evaluator) QueryInstant(ctx context.Context, req Request) (*tempopb.Que
 	if err != nil {
 		return nil, err
 	}
-	res := &tempopb.QueryInstantResponse{Metrics: rr.Metrics}
+	res := &tempopb.QueryInstantResponse{Metrics: rr.Metrics, Status: rr.Status, Message: rr.Message}
 	for _, s := range rr.Series {
 		var v float64
 		for _, smp := range s.Samples {
@@ -623,6 +676,7 @@ func (e *Evaluator) run(ctx context.Context, query string, start, end time.Time)
 	if err != nil {
 		return nil, fmt.Errorf("axiom query failed: %w", err)
 	}
+	e.note(res)
 	return res, nil
 }
 

@@ -2,13 +2,20 @@
 // Tempo engine can evaluate TraceQL search queries with exact semantics
 // while Axiom does the heavy filtering.
 //
-// A search runs two APL queries. The first finds candidate trace ids:
-// spans are filtered by the union of the query's spanset filters, counted
-// per trace and per filter, and traces are kept when the counts satisfy
-// the query's spanset structure (both sides present for && and structural
-// operators, either side for ||). The second pulls every span of those
-// traces. Spans are grouped into spansets and handed to the engine's
-// second pass, which applies the full TraceQL semantics.
+// A search runs at least two APL queries. The first finds candidate trace
+// ids: spans are filtered by the union of the query's spanset filters,
+// counted per trace and per filter, and traces are kept when the counts
+// satisfy the query's spanset structure (both sides present for && and
+// structural operators, either side for ||). The rest pull the spans of
+// those traces in batches of candidate ids, in candidate order, until the
+// span budget (MaxSpans) is spent. Spans are grouped into spansets and
+// handed to the engine's second pass, which applies the full TraceQL
+// semantics.
+//
+// A trace is only ever returned with all of its spans: when a batch query
+// hits its own row limit the traces it could not fetch completely are
+// dropped and counted in Stats.DroppedTraces, which the search handler
+// reports as the "droppedTraces" additional metric.
 package fetch
 
 import (
@@ -35,8 +42,12 @@ type Options struct {
 	Dataset string
 	// MaxTraces caps candidate traces pulled for one search.
 	MaxTraces int
-	// MaxSpans caps spans pulled in the second query.
+	// MaxSpans is the total span budget for the span pull of one search,
+	// spread over the batches. It also caps a trace-by-id query.
 	MaxSpans int
+	// BatchTraces is how many candidate trace ids one span-pull query
+	// asks for.
+	BatchTraces int
 	// DefaultLookback is used when the request has no time range.
 	DefaultLookback time.Duration
 	// TracePadding widens the span pull window so spans of a candidate
@@ -56,6 +67,9 @@ func (o Options) withDefaults() Options {
 	if o.MaxSpans <= 0 {
 		o.MaxSpans = 50000
 	}
+	if o.BatchTraces <= 0 {
+		o.BatchTraces = 50
+	}
 	if o.DefaultLookback <= 0 {
 		o.DefaultLookback = time.Hour
 	}
@@ -73,6 +87,11 @@ type Stats struct {
 	CandidateTraces int
 	SpansFetched    int
 	Queries         int
+	// DroppedTraces counts candidate traces whose spans were not fetched
+	// completely, either because the span budget ran out or because a
+	// batch query hit its row limit. Those traces are left out of the
+	// result rather than returned half-fetched.
+	DroppedTraces int
 }
 
 // Fetcher runs the two-phase fetch for one query.
@@ -228,27 +247,44 @@ func (f *Fetcher) candidates(ctx context.Context, start, end time.Time) ([]strin
 	return ids, nil
 }
 
-// pullTraces fetches all spans of the candidate traces and groups them,
-// preserving the candidate order.
+// pullTraces fetches the spans of the candidate traces in batches of
+// BatchTraces ids, in candidate order, and groups them, preserving that
+// order. Batches stop once the span budget (MaxSpans) is spent; traces
+// that could not be fetched whole are dropped and counted, so every trace
+// returned carries all of its spans.
 func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.Time) ([]*spans.Trace, error) {
-	m := f.tr.Mapping()
-	q := apl.NewQuery(f.opts.Dataset).
-		Where(translate.TraceIDsFilter(m, ids)).
-		Limit(f.opts.MaxSpans)
+	from, to := start.Add(-f.opts.TracePadding), end.Add(f.opts.TracePadding)
+	budget := f.opts.MaxSpans
+	size := f.opts.BatchTraces
 
-	res, err := f.run(ctx, q.String(), start.Add(-f.opts.TracePadding), end.Add(f.opts.TracePadding))
-	if err != nil {
-		return nil, err
+	fetched := make([]*spans.Trace, 0, len(ids))
+	for i := 0; i < len(ids); i += size {
+		if budget <= 0 {
+			// No room left for another whole trace.
+			f.stats.DroppedTraces += len(ids) - i
+			break
+		}
+		batch := ids[i:min(i+size, len(ids))]
+		traces, rows, complete, err := f.pullBatch(ctx, batch, budget, from, to)
+		if err != nil {
+			return nil, err
+		}
+		fetched = append(fetched, traces...)
+		budget -= rows
+		if !complete {
+			// The query hit its row limit: the trailing trace was cut in
+			// half and the candidates behind it were never fetched. Both
+			// are dropped rather than reported half-fetched.
+			f.stats.DroppedTraces += len(ids) - i - len(traces)
+			break
+		}
 	}
-	all := f.parser.Parse(res.FirstTable())
-	f.stats.SpansFetched += len(all)
-	traces := spans.GroupTraces(all)
 
-	byID := make(map[string]*spans.Trace, len(traces))
-	for _, t := range traces {
+	byID := make(map[string]*spans.Trace, len(fetched))
+	for _, t := range fetched {
 		byID[t.HexTraceID()] = t
 	}
-	ordered := make([]*spans.Trace, 0, len(traces))
+	ordered := make([]*spans.Trace, 0, len(fetched))
 	seen := map[string]bool{}
 	for _, id := range ids {
 		key := normaliseTraceID(id)
@@ -257,12 +293,58 @@ func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.
 			seen[key] = true
 		}
 	}
-	for _, t := range traces {
+	for _, t := range fetched {
 		if !seen[t.HexTraceID()] {
+			seen[t.HexTraceID()] = true
 			ordered = append(ordered, t)
 		}
 	}
 	return ordered, nil
+}
+
+// pullBatch runs one span-pull query for a batch of candidate ids. It
+// reports the complete traces it fetched, how many rows the query
+// returned (charged against the span budget) and whether the batch fit
+// inside that budget.
+//
+// The query asks for one row more than the budget allows, so a result
+// that overflows it is recognisable rather than merely suspected. Rows
+// are sorted by trace id so that the overflow lands on a trace boundary:
+// every trace but the last one in that order is whole, and the last one
+// is dropped.
+func (f *Fetcher) pullBatch(ctx context.Context, ids []string, budget int, from, to time.Time) ([]*spans.Trace, int, bool, error) {
+	m := f.tr.Mapping()
+	q := apl.NewQuery(f.opts.Dataset).
+		Where(translate.TraceIDsFilter(m, ids)).
+		Sort(m.TraceID().Expr + " asc").
+		Limit(budget + 1)
+
+	res, err := f.run(ctx, q.String(), from, to)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	table := res.FirstTable()
+	rows := table.NumRows()
+	all := f.parser.Parse(table)
+	f.stats.SpansFetched += len(all)
+	traces := spans.GroupTraces(all)
+	if rows <= budget {
+		return traces, rows, true, nil
+	}
+	// Truncated: drop the last trace in trace-id order, whichever
+	// position it ended up in.
+	last, at := "", -1
+	for i, t := range traces {
+		if id := t.HexTraceID(); id > last {
+			last, at = id, i
+		}
+	}
+	if at >= 0 {
+		traces = append(traces[:at:at], traces[at+1:]...)
+	}
+	f.opts.Log.Warn("span pull ran out of budget; dropping incomplete traces",
+		"budget", budget, "rows", rows, "batch", len(ids), "kept", len(traces))
+	return traces, rows, false, nil
 }
 
 func normaliseTraceID(id string) string {
@@ -520,8 +602,19 @@ func (p *plan) operationWhere(tr *translate.Translator, op *traceql.SpansetOpera
 	return "", false
 }
 
-// FetchTrace pulls one trace by hex id within the window.
-func FetchTrace(ctx context.Context, client *axiom.Client, tr *translate.Translator, opts Options, hexID string, start, end time.Time) (*spans.Trace, error) {
+// TraceStatus reports why a trace-by-id result may be incomplete.
+type TraceStatus struct {
+	// Partial is set when the trace is known to be missing data: the
+	// query hit the span limit, or Axiom reported a partial result.
+	Partial bool
+	// Message explains the partial result to the caller.
+	Message string
+}
+
+// FetchTrace pulls one trace by hex id within the window. The returned
+// status says whether the trace is complete: a query that comes back with
+// as many rows as it asked for has almost certainly left spans behind.
+func FetchTrace(ctx context.Context, client *axiom.Client, tr *translate.Translator, opts Options, hexID string, start, end time.Time) (*spans.Trace, TraceStatus, error) {
 	opts = opts.withDefaults()
 	m := tr.Mapping()
 	q := apl.NewQuery(opts.Dataset).
@@ -533,12 +626,27 @@ func FetchTrace(ctx context.Context, client *axiom.Client, tr *translate.Transla
 	}
 	res, err := client.Query(ctx, query, axiom.QueryOptions{Start: start, End: end})
 	if err != nil {
-		return nil, fmt.Errorf("axiom query failed: %w", err)
+		return nil, TraceStatus{}, fmt.Errorf("axiom query failed: %w", err)
 	}
-	all := spans.NewParser(m).Parse(res.FirstTable())
+	table := res.FirstTable()
+	all := spans.NewParser(m).Parse(table)
 	traces := spans.GroupTraces(all)
 	if len(traces) == 0 {
-		return nil, nil
+		return nil, TraceStatus{}, nil
 	}
-	return traces[0], nil
+
+	var st TraceStatus
+	var reasons []string
+	if table.NumRows() >= opts.MaxSpans {
+		st.Partial = true
+		reasons = append(reasons, fmt.Sprintf("trace truncated at the %d span limit", opts.MaxSpans))
+		opts.Log.Warn("trace truncated at the span limit", "trace", hexID, "limit", opts.MaxSpans, "apl", query)
+	}
+	if res.Status.IsPartial {
+		st.Partial = true
+		reasons = append(reasons, "axiom returned partial results")
+	}
+	reasons = append(reasons, res.Status.Warnings()...)
+	st.Message = strings.Join(reasons, "; ")
+	return traces[0], st, nil
 }

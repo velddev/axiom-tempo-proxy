@@ -37,6 +37,9 @@ type fakeAxiom struct {
 	fieldsForbidden bool
 	// queryError, when set, lets a test fail specific queries.
 	queryError func(apl string) (int, string)
+	// status, when set, adds fields to the result status of matching
+	// queries, e.g. {"isPartial": true}.
+	status func(apl string) map[string]any
 }
 
 func newFakeAxiom(t *testing.T, respond func(apl string) ([]axiom.Field, [][]any)) *fakeAxiom {
@@ -74,8 +77,12 @@ func newFakeAxiom(t *testing.T, respond func(apl string) ([]axiom.Field, [][]any
 			}
 		}
 		fields, rows := f.respond(body.APL)
+		var status map[string]any
+		if f.status != nil {
+			status = f.status(body.APL)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(tabular(fields, rows))
+		_, _ = w.Write(tabular(fields, rows, status))
 	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
@@ -110,8 +117,9 @@ func datasetFields() []axiom.DatasetField {
 	}
 }
 
-// tabular encodes column-major tabular JSON.
-func tabular(fields []axiom.Field, rows [][]any) []byte {
+// tabular encodes column-major tabular JSON. Extra status fields (such as
+// isPartial or messages) are merged into the result status.
+func tabular(fields []axiom.Field, rows [][]any, extraStatus ...map[string]any) []byte {
 	cols := make([][]any, len(fields))
 	for i := range cols {
 		cols[i] = []any{}
@@ -119,6 +127,12 @@ func tabular(fields []axiom.Field, rows [][]any) []byte {
 	for _, row := range rows {
 		for i := range fields {
 			cols[i] = append(cols[i], row[i])
+		}
+	}
+	status := map[string]any{"rowsMatched": len(rows)}
+	for _, extra := range extraStatus {
+		for k, v := range extra {
+			status[k] = v
 		}
 	}
 	res := map[string]any{
@@ -129,7 +143,7 @@ func tabular(fields []axiom.Field, rows [][]any) []byte {
 			"fields":  fields,
 			"columns": cols,
 		}},
-		"status": map[string]any{"rowsMatched": len(rows)},
+		"status": status,
 	}
 	b, _ := json.Marshal(res)
 	return b
@@ -256,7 +270,7 @@ type harness struct {
 	web  *httptest.Server
 }
 
-func newHarness(t *testing.T, respond func(string) ([]axiom.Field, [][]any)) *harness {
+func newHarness(t *testing.T, respond func(string) ([]axiom.Field, [][]any), tweak ...func(*config.Config)) *harness {
 	t.Helper()
 	if respond == nil {
 		respond = defaultRespond
@@ -267,6 +281,9 @@ func newHarness(t *testing.T, respond func(string) ([]axiom.Field, [][]any)) *ha
 	cfg.AxiomToken = "test-token"
 	cfg.Dataset = "otel"
 	cfg.LogQueries = true
+	for _, fn := range tweak {
+		fn(&cfg)
+	}
 	client, err := axiom.New(axiom.Config{BaseURL: cfg.AxiomURL, Token: cfg.AxiomToken})
 	if err != nil {
 		t.Fatal(err)

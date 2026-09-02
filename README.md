@@ -23,11 +23,21 @@ search, tag autocomplete, and the RED metrics panels.
 
 ## How it works
 
-- **Trace by id** is one APL query on `trace_id`, converted to OTLP.
+- **Trace by id** is one APL query on `trace_id`, converted to OTLP. If
+  the query hits the span cap the trace is still returned, but the v2
+  response is marked `PARTIAL` with a message (v1 has no status field).
 - **Search** pushes the query's spanset filters down to APL to find
   candidate traces, pulls the spans of those traces, and runs Tempo's own
   TraceQL engine in-process over them. Structural operators, aggregates,
   `select`, `by`, and `coalesce` all work exactly as in Tempo.
+- **Partial results are explicit.** The span pull runs in batches of
+  `PROXY_SEARCH_BATCH_TRACES` candidate traces (one query when they all
+  fit) and stops once the `PROXY_MAX_SPANS_PER_FETCH` budget is spent, so
+  a trace is either returned whole or not at all. Candidates left out are
+  counted in `metrics.additionalMetrics.droppedTraces` on the search
+  response and logged with the query. Metrics responses set
+  `status: PARTIAL` with a message when Axiom reports a partial result,
+  and pass Axiom's status messages through.
 - **Search ranking**: a search returns at most `limit` traces, newest
   first. When the query `select()`s attributes (Drilldown's Exceptions tab
   selects `event.exception.*`), traces that actually carry those
@@ -92,7 +102,8 @@ token can read is accepted.
 | `PROXY_DEFAULT_LOOKBACK` | `-default-lookback` | `1h` | search window when none is given |
 | `PROXY_TRACE_LOOKBACK` | `-trace-lookback` | `24h` | trace-by-id window when none is given |
 | `PROXY_MAX_SEARCH_TRACES` | `-max-search-traces` | `500` | cap on candidate traces per search |
-| `PROXY_MAX_SPANS_PER_FETCH` | `-max-spans-per-fetch` | `50000` | cap on spans pulled per query |
+| `PROXY_MAX_SPANS_PER_FETCH` | `-max-spans-per-fetch` | `50000` | span budget for one search (across its batches) or one trace |
+| `PROXY_SEARCH_BATCH_TRACES` | `-search-batch-traces` | `50` | candidate traces per span-pull query during a search |
 | `PROXY_MAX_TAG_VALUES` | `-max-tag-values` | `5000` | cap on tag values |
 | `PROXY_SCHEMA_REFRESH` | `-schema-refresh` | `5m` | schema re-discovery interval |
 | `PROXY_QUERY_TIMEOUT` | `-query-timeout` | `60s` | per-request timeout |
