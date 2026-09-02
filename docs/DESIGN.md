@@ -2,9 +2,9 @@
 
 axiom-tempo-proxy exposes the Grafana Tempo query API and answers every
 request from an Axiom dataset of OpenTelemetry spans by generating APL.
-One proxy request always targets one dataset: datasets are split per
-environment, so a Grafana datasource maps to one dataset (configured, or
-selected per request through a header).
+One proxy request always targets exactly one dataset, either the
+configured default or one selected per request by URL prefix, header or
+query parameter.
 
 ## Components
 
@@ -60,7 +60,7 @@ gives exact TraceQL semantics with bounded data transfer.
 **Partial results.** A half-fetched trace is worse than a missing one: it
 makes structural operators and aggregates lie. So each batch asks for one
 row more than the budget allows and sorts by `trace_id`, which makes an
-overflow both detectable and aligned to a trace boundary — the trailing
+overflow both detectable and aligned to a trace boundary. The trailing
 trace, and every candidate behind it, is dropped rather than returned
 incomplete. Dropped candidates are counted in `fetch.Stats` and reported
 as `metrics.additionalMetrics.droppedTraces` on the search response
@@ -73,7 +73,7 @@ Axiom's status messages are passed through in that message.
 Query 2 `project`s only the columns the fetch request needs: every
 intrinsic the dataset has, the top-level resource fields (`service.*`,
 `telemetry.*`), and the columns backing the attributes the request
-references — a flat column, a custom map when the attribute lives in one,
+references: a flat column, a custom map when the attribute lives in one,
 `events`/`links` for event- and link-scoped attributes. The engine only
 ever reports the attributes the query mentioned (`spans.AttrSet`, derived
 from the same conditions), so the projection cannot change results. It is
@@ -119,10 +119,11 @@ turned into a `trace_id in (...)` restriction on the metrics query.
 
 *Splitting the filter.* `translate.SplitTrace` flattens the filter's
 top-level `&&` chain and sorts each conjunct into the trace-level or the
-span-level bucket. A conjunct that mixes both — `{ traceDuration > 2s ||
-status = error }` — cannot be split and is refused with a 400; a
-disjunction of purely trace-level terms is fine and stays on the trace
-side. Span-level conjuncts still go into the metrics query's `where`, so
+span-level bucket. A conjunct that mixes both, such as
+`{ traceDuration > 2s || status = error }`, cannot be split and is refused
+with a 400. A disjunction of purely trace-level terms is fine and stays on
+the trace side. Span-level conjuncts still go into the metrics query's
+`where`, so
 `{ rootServiceName = "web" && status = error } | rate() by (name)` counts
 only the error spans of the web-rooted traces.
 
@@ -143,7 +144,7 @@ only the error spans of the web-rooted traces.
 `_td` is the trace duration (last span end minus first span start). The
 `arg_min` sort key puts parentless spans ahead of every real timestamp, so
 `_rn`/`_rs` come from the root span when the trace has one and from the
-earliest span otherwise — the rule `spans.Trace.finish()` already uses for
+earliest span otherwise, the same rule `spans.Trace.finish()` uses for
 search. Only the values a query actually needs are computed. The final
 `summarize` returns the exact number of qualifying traces alongside a
 bounded id list, so overflow is detected rather than silently clipped.
@@ -159,21 +160,20 @@ at are narrowed first wherever that cannot change the result:
   (`where (isempty(parent_span_id)) and (name == "GET /x")`);
 - otherwise the aggregation runs over every trace in the window.
 
-*Why not `join`.* Measured against a live dataset: `where trace_id in
-(<subquery>)` is rejected outright ("the in parameter can not currently
-handle table expressions with operations"), and `join kind=inner` silently
-truncates its **left** side at 50,000 rows — a join over 510k spans came
-back with exactly 50,000 and no warning at all in the response. The right
-side does warn (`join_rhs_limit_warning`); the left does not, so a join
-would return plausible-looking wrong numbers. Inlining the ids costs one
-extra query and about 36 bytes of query body per trace (~180 KB at the
-5000 cap, which Axiom accepts) but is exact.
+*Why not `join`.* APL rejects `where trace_id in (<subquery>)` outright
+("the in parameter can not currently handle table expressions with
+operations"). `join kind=inner` silently truncates its **left** side at
+50,000 rows: an oversized left side comes back at exactly 50,000 rows with
+no warning in the response, while an oversized right side does warn
+(`join_rhs_limit_warning`). A join would therefore return
+plausible-looking wrong numbers. Inlining the ids costs one extra query
+and about 36 bytes of query body per trace, roughly 180 KB at the 5000
+cap, which Axiom accepts. It is exact.
 
 *Limits.* Each of these is a deliberate 400, never a silently wrong number:
 
-- Axiom caps the group cardinality of a `summarize` and flags such a
-  result with `isEstimate` and a `max_limit_warning` message; on a busy
-  dataset it starts dropping groups at roughly 5000 traces. The trace
+- Axiom caps the group cardinality of a `summarize` and flags a truncated
+  result with `isEstimate` and a `max_limit_warning` message. The trace
   queries carry no explicit `limit` (which raises the same flags on its
   own), so the flag means truncation and the request is refused with
   *"too many traces in the query window to evaluate the trace-level
@@ -197,11 +197,12 @@ to `true`, so the search prefilter stays a superset and Tempo's engine
 evaluates them exactly on the fetched spansets (`traceql.Spanset` carries
 `RootSpanName`, `RootServiceName` and `DurationNanos`). Pushing the
 trace-level predicate into the candidate query would turn the prefilter
-into a *subset* at the window edges — a trace whose spans are clipped has
-a shorter measured duration and would be dropped before the engine ever
-saw it — so it is deliberately left out. The cost is that a search whose
-only filter is trace-level inspects just the newest `limit * 3` candidate
-traces and may come back empty, as with any other relaxed prefilter.
+into a *subset* at the window edges, because a trace whose spans are
+clipped has a shorter measured duration and would be dropped before the
+engine ever saw it. So it is deliberately left out. The cost is that a
+search whose only filter is trace-level inspects just the newest
+`limit * 3` candidate traces and may come back empty, as with any other
+relaxed prefilter.
 
 **Tags and tag values.** Tag names come from the dataset field list
 (flattened `attributes.*`/`resource.*` fields) plus keys sampled from the

@@ -1,6 +1,6 @@
-# Tempo Query-Frontend HTTP API — Implementation Reference
+# Tempo query-frontend HTTP API: implementation reference
 
-Research compiled 2026-09-02 by reading Tempo, grafana-tempo-datasource, and traces-drilldown sources directly, plus the public docs at https://grafana.com/docs/tempo/latest/api_docs/, https://grafana.com/docs/tempo/latest/traceql/construct-traceql-queries/, https://grafana.com/docs/tempo/latest/metrics-from-traces/metrics-queries/functions/.
+Reference notes compiled from the Tempo, grafana-tempo-datasource, and traces-drilldown sources, plus the public docs at https://grafana.com/docs/tempo/latest/api_docs/, https://grafana.com/docs/tempo/latest/traceql/construct-traceql-queries/, https://grafana.com/docs/tempo/latest/metrics-from-traces/metrics-queries/functions/.
 
 Note: the Grafana Tempo datasource no longer lives in grafana/grafana; it was extracted to https://github.com/grafana/grafana-tempo-datasource (v13.1.5, bundled with Grafana >= 12.3).
 

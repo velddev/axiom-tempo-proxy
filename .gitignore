@@ -1,3 +1,13 @@
-bin/
+# build output
+/bin/
 *.exe
+*.exe~
+
+# local configuration and secrets
 .env
+.env.*
+
+# editor and OS noise
+.idea/
+.vscode/
+.DS_Store
