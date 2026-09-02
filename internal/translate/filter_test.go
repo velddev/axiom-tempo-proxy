@@ -113,6 +113,40 @@ func TestFilterUndiscovered(t *testing.T) {
 	}
 }
 
+func TestFilterEventAttributes(t *testing.T) {
+	cfg := schema.DefaultConfig()
+	cfg.MaxEventsPerSpan = 2
+	fields := append(testFields(), axiom.DatasetField{Name: "events", Type: "array"})
+	tr := New(schema.New(cfg, fields))
+	e0 := "events[0]['attributes']['exception.type']"
+	e1 := "events[1]['attributes']['exception.type']"
+	cases := map[string]string{
+		`{ event.exception.type = "X" }`:                         `(tostring(` + e0 + `) == "X") or (tostring(` + e1 + `) == "X")`,
+		`{ event.exception.type != "X" }`:                        `not((tostring(` + e0 + `) == "X") or (tostring(` + e1 + `) == "X"))`,
+		`{ event.exception.type =~ "X.*" }`:                      `(tostring(` + e0 + `) matches regex @"^(?:X.*)$") or (tostring(` + e1 + `) matches regex @"^(?:X.*)$")`,
+		`{ event.exception.type != nil }`:                        `(isnotnull(` + e0 + `)) or (isnotnull(` + e1 + `))`,
+		`{ event.exception.type = nil }`:                         `not((isnotnull(` + e0 + `)) or (isnotnull(` + e1 + `)))`,
+		`{ event:name = "exception" }`:                           `(tostring(events[0]['name']) == "exception") or (tostring(events[1]['name']) == "exception")`,
+		`{ status = error && event.exception.message = "boom" }`: `((['status.code'] =~ "error") or (['status.code'] =~ "STATUS_CODE_ERROR") or (error == true)) and ((tostring(events[0]['attributes']['exception.message']) == "boom") or (tostring(events[1]['attributes']['exception.message']) == "boom"))`,
+	}
+	for q, want := range cases {
+		expr, err := ParseFilter(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		f := tr.Filter(expr)
+		if f.Where != want || !f.Exact {
+			t.Errorf("%s:\n  got  %q exact=%v\n  want %q", q, f.Where, f.Exact, want)
+		}
+	}
+	// Without an events column the filter is relaxed, not broken.
+	noEvents := New(schema.New(cfg, testFields()))
+	expr, _ := ParseFilter(`{ event.exception.type = "X" }`)
+	if f := noEvents.Filter(expr); f.Exact || f.Where != "" {
+		t.Errorf("no events column: %+v", f)
+	}
+}
+
 // A dataset without custom maps: unknown attributes cannot exist, and
 // referencing them in APL would be a hard error, so they become false.
 func TestFilterMissingAttributes(t *testing.T) {

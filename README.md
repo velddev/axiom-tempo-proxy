@@ -35,6 +35,11 @@ search, tag autocomplete, and the RED metrics panels.
   shows the data the caller asked for instead of being dominated by, say,
   exception-free errors. Every returned trace still matches the filter.
   Disable with `PROXY_NO_PREFER_SELECTED=true`.
+- **Event attributes** (`event.exception.type = "X"`, `event:name`) are
+  pushed down too: the `events` array has no per-row "any element
+  matches" construct in APL, so the test is repeated over the first
+  `MaxEventsPerSpan` (8) event slots and or-ed. Spans with more events
+  than that are only matched on their first eight.
 - **Metrics** are translated to native APL `summarize ... by bin(_time, step)`
   aggregations, so they scale with Axiom rather than with the proxy.
 - The dataset's field list is discovered at startup (and refreshed) so

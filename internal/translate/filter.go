@@ -404,17 +404,76 @@ func (t *Translator) specialIntrinsic(a traceql.Attribute, op traceql.Operator, 
 			return apl.Not(root), true, true
 		}
 		return "", true, false
+	case traceql.IntrinsicEventName:
+		expr, ok := t.eventPredicate("", op, st)
+		return expr, true, ok
 	case traceql.IntrinsicNestedSetLeft, traceql.IntrinsicNestedSetRight, traceql.IntrinsicChildCount,
 		traceql.IntrinsicTraceRootService, traceql.IntrinsicTraceRootSpan, traceql.IntrinsicTraceDuration,
 		traceql.ScopedIntrinsicTraceRootName, traceql.ScopedIntrinsicTraceRootService, traceql.ScopedIntrinsicTraceDuration,
-		traceql.IntrinsicEventName, traceql.IntrinsicEventTimeSinceStart,
+		traceql.IntrinsicEventTimeSinceStart,
 		traceql.IntrinsicLinkSpanID, traceql.IntrinsicLinkTraceID, traceql.IntrinsicParent:
 		return "", true, false
 	}
-	if a.Parent || a.Scope == traceql.AttributeScopeEvent || a.Scope == traceql.AttributeScopeLink {
+	if a.Scope == traceql.AttributeScopeEvent && !a.Parent {
+		expr, ok := t.eventPredicate(a.Name, op, st)
+		return expr, true, ok
+	}
+	if a.Parent || a.Scope == traceql.AttributeScopeLink {
 		return "", true, false
 	}
 	return "", false, false
+}
+
+// eventPredicate renders a comparison against an event attribute. Events
+// are an array of {name, attributes} objects, and APL cannot express
+// "any element matches" per row, so the comparison is repeated over the
+// first MaxEventsPerSpan slots and or-ed: a span matches when any event
+// does, which is TraceQL's semantics for event attributes. Negated
+// comparisons match when no event does.
+func (t *Translator) eventPredicate(name string, op traceql.Operator, st traceql.Static) (string, bool) {
+	slots, ok := t.m.EventSlots(name)
+	if !ok {
+		return "", false
+	}
+	var parts []string
+	f := &Filter{}
+	switch {
+	case st.Type == traceql.TypeNil && op == traceql.OpExists, st.Type == traceql.TypeNil && op == traceql.OpEqual:
+		for _, s := range slots {
+			parts = append(parts, apl.Call("isnotnull", s))
+		}
+		if op == traceql.OpEqual {
+			return apl.Not(apl.Or(parts...)), true
+		}
+		return apl.Or(parts...), true
+	case st.Type == traceql.TypeNil && op == traceql.OpNotExists, st.Type == traceql.TypeNil && op == traceql.OpNotEqual:
+		for _, s := range slots {
+			parts = append(parts, apl.Call("isnotnull", s))
+		}
+		if op == traceql.OpNotEqual {
+			return apl.Or(parts...), true
+		}
+		return apl.Not(apl.Or(parts...)), true
+	}
+	positive := op
+	negated := false
+	switch op {
+	case traceql.OpNotEqual:
+		positive, negated = traceql.OpEqual, true
+	case traceql.OpNotRegex:
+		positive, negated = traceql.OpRegex, true
+	}
+	for _, s := range slots {
+		p, ok := t.compareStatic(s, schema.TypeUnknown, positive, st, f)
+		if !ok {
+			return "", false
+		}
+		parts = append(parts, p)
+	}
+	if negated {
+		return apl.Not(apl.Or(parts...)), true
+	}
+	return apl.Or(parts...), true
 }
 
 func (t *Translator) statusPredicate(expr string, op traceql.Operator, s traceql.Status, f *Filter) (string, bool) {

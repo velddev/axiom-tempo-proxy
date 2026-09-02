@@ -11,6 +11,7 @@
 package schema
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -105,6 +106,10 @@ type Config struct {
 	// TopLevelResourceFields are resource attributes stored as top-level
 	// fields under their own name (e.g. service.name).
 	TopLevelResourceFields []string
+	// MaxEventsPerSpan bounds how many event slots are inspected when a
+	// query filters on event attributes; APL has no per-span "any element
+	// matches" construct, so the test is repeated per index.
+	MaxEventsPerSpan int
 }
 
 // DefaultConfig returns the Axiom OTel trace dataset layout.
@@ -134,6 +139,7 @@ func DefaultConfig() Config {
 			"service.name", "service.version", "service.instance.id", "service.namespace",
 			"telemetry.sdk.language", "telemetry.sdk.name", "telemetry.sdk.version",
 		},
+		MaxEventsPerSpan: 8,
 	}
 }
 
@@ -167,7 +173,36 @@ func (c Config) withDefaults() Config {
 	if c.TopLevelResourceFields == nil {
 		c.TopLevelResourceFields = d.TopLevelResourceFields
 	}
+	if c.MaxEventsPerSpan <= 0 {
+		c.MaxEventsPerSpan = d.MaxEventsPerSpan
+	}
 	return c
+}
+
+// EventSlots returns, for an event attribute name, one column expression
+// per inspected event slot, e.g. events[0]['attributes']['exception.type'].
+// The bool is false when the dataset has no events column. An empty name
+// addresses the event's own name (event:name).
+func (m *Mapping) EventSlots(name string) ([]string, bool) {
+	ev := m.Events()
+	if ev.Missing {
+		return nil, false
+	}
+	out := make([]string, 0, m.cfg.MaxEventsPerSpan)
+	for i := 0; i < m.cfg.MaxEventsPerSpan; i++ {
+		slot := fmt.Sprintf("%s[%d]", ev.Expr, i)
+		if name == "" {
+			out = append(out, slot+"['name']")
+		} else {
+			out = append(out, slot+"['attributes']['"+escapeKey(name)+"']")
+		}
+	}
+	return out, true
+}
+
+func escapeKey(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `'`, `\'`)
 }
 
 // Mapping resolves TraceQL attributes to dataset columns.
