@@ -46,6 +46,14 @@ type Config struct {
 	SearchBatchTraces int
 	// MaxTagValues caps values returned for tag autocomplete.
 	MaxTagValues int
+	// DefaultExemplars is how many exemplars a metrics query returns per
+	// series when the request does not ask for a number. Grafana and
+	// Traces Drilldown do not send the exemplars parameter, so a non-zero
+	// default is what puts clickable trace dots on their panels. Zero
+	// disables exemplars unless a request asks for them.
+	DefaultExemplars int
+	// MaxExemplars caps the exemplars per series a request may ask for.
+	MaxExemplars int
 	// TagSampleRows is how many rows are sampled to discover map keys.
 	TagSampleRows int
 	// DefaultLookback is the search window when the client omits one.
@@ -77,6 +85,8 @@ func Default() Config {
 		MaxSpansPerFetch:  50000,
 		SearchBatchTraces: 50,
 		MaxTagValues:      5000,
+		DefaultExemplars:  100,
+		MaxExemplars:      1000,
 		TagSampleRows:     2000,
 		DefaultLookback:   time.Hour,
 		TraceLookback:     24 * time.Hour,
@@ -141,6 +151,8 @@ func Load(args []string) (Config, error) {
 		envInt("PROXY_MAX_SPANS_PER_FETCH", &c.MaxSpansPerFetch),
 		envInt("PROXY_SEARCH_BATCH_TRACES", &c.SearchBatchTraces),
 		envInt("PROXY_MAX_TAG_VALUES", &c.MaxTagValues),
+		envInt("PROXY_DEFAULT_EXEMPLARS", &c.DefaultExemplars),
+		envInt("PROXY_MAX_EXEMPLARS", &c.MaxExemplars),
 		envInt("PROXY_TAG_SAMPLE_ROWS", &c.TagSampleRows),
 	} {
 		if err != nil {
@@ -165,6 +177,8 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&c.MaxSpansPerFetch, "max-spans-per-fetch", c.MaxSpansPerFetch, "cap on spans pulled per search or trace")
 	fs.IntVar(&c.SearchBatchTraces, "search-batch-traces", c.SearchBatchTraces, "candidate traces per span-pull query")
 	fs.IntVar(&c.MaxTagValues, "max-tag-values", c.MaxTagValues, "cap on tag values")
+	fs.IntVar(&c.DefaultExemplars, "default-exemplars", c.DefaultExemplars, "exemplars per series when the request does not ask for a number (0 disables)")
+	fs.IntVar(&c.MaxExemplars, "max-exemplars", c.MaxExemplars, "cap on exemplars per series")
 	fs.IntVar(&c.TagSampleRows, "tag-sample-rows", c.TagSampleRows, "rows sampled to discover map keys")
 	if err := fs.Parse(args); err != nil {
 		return c, err

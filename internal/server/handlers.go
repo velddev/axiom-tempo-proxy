@@ -680,7 +680,24 @@ func (s *Server) metricsRequest(w http.ResponseWriter, r *http.Request, instant 
 		s.writeError(w, http.StatusBadRequest, "http parameter start must be before end")
 		return metrics.Request{}, false
 	}
-	req := metrics.Request{Query: query, StartNs: uint64(start.UnixNano()), EndNs: uint64(end.UnixNano())}
+	// `exemplars` is how many exemplars the caller wants per series.
+	// Tempo treats an absent or unparsable value as 0 and then, unless
+	// the query carries a with(exemplars=...) hint, replaces 0 with its
+	// configured max_exemplars; the evaluator does that second step.
+	// Neither Grafana's Tempo datasource nor Traces Drilldown sends the
+	// parameter, so the default is what puts dots on their panels.
+	exemplars, err := parseUint(r, "exemplars", 0)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return metrics.Request{}, false
+	}
+
+	req := metrics.Request{
+		Query:     query,
+		StartNs:   uint64(start.UnixNano()),
+		EndNs:     uint64(end.UnixNano()),
+		Exemplars: int(exemplars),
+	}
 	if !instant {
 		step, err := parseStep(q.Get("step"))
 		if err != nil {
@@ -698,9 +715,11 @@ func (s *Server) metricsRequest(w http.ResponseWriter, r *http.Request, instant 
 
 func (s *Server) evaluator(ds *datasetSchema) *metrics.Evaluator {
 	return metrics.New(s.client, ds.translator, metrics.Options{
-		Dataset:    ds.name,
-		Log:        s.log,
-		LogQueries: s.cfg.LogQueries,
+		Dataset:          ds.name,
+		DefaultExemplars: s.cfg.DefaultExemplars,
+		MaxExemplars:     s.cfg.MaxExemplars,
+		Log:              s.log,
+		LogQueries:       s.cfg.LogQueries,
 	})
 }
 
