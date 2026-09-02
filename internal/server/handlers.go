@@ -336,13 +336,17 @@ func (s *Server) handleSearchTags(w http.ResponseWriter, r *http.Request) {
 			if scope != traceql.AttributeScopeNone && scope.String() != name {
 				return
 			}
+			// A scope without tags is omitted, as Tempo does. jsonpb drops
+			// empty lists, and Grafana's datasource calls tags.filter() on
+			// every scope, which throws on a missing list.
+			if len(tags) == 0 {
+				return
+			}
 			res.Scopes = append(res.Scopes, &tempopb.SearchTagsV2Scope{Name: name, Tags: cap_(tags)})
 		}
 		add("resource", resTags)
 		add("span", spanTags)
 		add("intrinsic", intrinsicTags)
-		add("event", nil)
-		add("link", nil)
 		s.writeMessage(w, r, res, false)
 		return
 	}

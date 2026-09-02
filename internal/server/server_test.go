@@ -503,7 +503,15 @@ func TestSearchTagsV2(t *testing.T) {
 	h.getJSON(t, "/api/v2/search/tags?limit=5000", &res)
 	scopes := map[string][]string{}
 	for _, sc := range res.Scopes {
+		if len(sc.Tags) == 0 {
+			t.Errorf("scope %q has no tags; Grafana's getTagKeys throws on scopes without a tags list", sc.Name)
+		}
 		scopes[sc.Name] = sc.Tags
+	}
+	// Raw JSON must not contain a tag-less scope either.
+	_, raw := h.get(t, "/api/v2/search/tags", "application/json")
+	if strings.Contains(string(raw), `{"name":"event"}`) || strings.Contains(string(raw), `{"name":"link"}`) {
+		t.Errorf("tag-less scope in response: %s", raw)
 	}
 	if !contains(scopes["resource"], "service.name") || !contains(scopes["resource"], "k8s.pod.name") || !contains(scopes["resource"], "deployment.environment") {
 		t.Errorf("resource tags = %v", scopes["resource"])
