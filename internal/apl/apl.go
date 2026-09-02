@@ -187,7 +187,10 @@ func (q *Query) Project(cols ...string) *Query {
 
 // Summarize appends a summarize stage.
 func (q *Query) Summarize(aggs []string, by []string) *Query {
-	s := "summarize " + strings.Join(aggs, ", ")
+	s := "summarize"
+	if len(aggs) > 0 {
+		s += " " + strings.Join(aggs, ", ")
+	}
 	if len(by) > 0 {
 		s += " by " + strings.Join(by, ", ")
 	}

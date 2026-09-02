@@ -609,9 +609,10 @@ func (s *Server) metricsRequest(w http.ResponseWriter, r *http.Request, instant 
 
 func (s *Server) evaluator(ds *datasetSchema) *metrics.Evaluator {
 	return metrics.New(s.client, ds.translator, metrics.Options{
-		Dataset:    ds.name,
-		Log:        s.log,
-		LogQueries: s.cfg.LogQueries,
+		Dataset:                 ds.name,
+		MaxTraceIntrinsicTraces: s.cfg.MaxTraceIntrinsicTraces,
+		Log:                     s.log,
+		LogQueries:              s.cfg.LogQueries,
 	})
 }
 

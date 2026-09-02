@@ -38,6 +38,12 @@ const (
 	maxCompareValuesDef = 10
 )
 
+// defaultMaxTraceIntrinsicTraces bounds how many trace ids a trace-level
+// filter may resolve to before the query is refused. It is also the cap
+// passed to make_list(), and matches the point where Axiom starts
+// truncating a per-trace summarize anyway.
+const defaultMaxTraceIntrinsicTraces = 5000
+
 // UnsupportedError reports a query the native translation cannot run
 // exactly. Handlers map it to a 400 so users see why.
 type UnsupportedError struct{ Reason string }
@@ -53,8 +59,11 @@ type Options struct {
 	MaxCompareAttributes int
 	// CompareConcurrency bounds parallel compare() queries.
 	CompareConcurrency int
-	Log                *slog.Logger
-	LogQueries         bool
+	// MaxTraceIntrinsicTraces caps the traces a trace-level filter
+	// (traceDuration, rootName, rootServiceName) may resolve to.
+	MaxTraceIntrinsicTraces int
+	Log                     *slog.Logger
+	LogQueries              bool
 }
 
 func (o Options) withDefaults() Options {
@@ -66,6 +75,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.CompareConcurrency <= 0 {
 		o.CompareConcurrency = 4
+	}
+	if o.MaxTraceIntrinsicTraces <= 0 {
+		o.MaxTraceIntrinsicTraces = defaultMaxTraceIntrinsicTraces
 	}
 	if o.Log == nil {
 		o.Log = slog.Default()
@@ -257,16 +269,35 @@ func (e *Evaluator) groupCols(by []traceql.Attribute) ([]groupCol, error) {
 	return out, nil
 }
 
-// filterWhere renders the query's spanset filter, requiring exactness.
-func (e *Evaluator) filterWhere(mq *translate.MetricsQuery) (string, error) {
+// filterWhere renders the query's spanset filter as an APL predicate,
+// requiring exactness. Trace-level intrinsics are split off and resolved
+// against the dataset first (see traceFilter), so the returned predicate
+// is always evaluable row by row.
+func (e *Evaluator) filterWhere(ctx context.Context, mq *translate.MetricsQuery, start, end time.Time) (string, error) {
 	if !mq.FilterExact {
 		return "", &UnsupportedError{Reason: "spanset pipelines other than filters are not supported in metrics queries"}
 	}
-	f := e.tr.Filter(mq.Filter)
-	if !f.Exact {
-		return "", &UnsupportedError{Reason: "filter uses attributes that cannot be evaluated in APL: " + strings.Join(f.Unsupported, ", ")}
+	split := translate.SplitTrace(mq.Filter)
+	if split.Mixed {
+		return "", unsupportedMixed(mq.Filter)
 	}
-	return f.Where, nil
+
+	var spanWhere string
+	if split.Span != nil {
+		f := e.tr.Filter(split.Span)
+		if !f.Exact {
+			return "", &UnsupportedError{Reason: "filter uses attributes that cannot be evaluated in APL: " + strings.Join(f.Unsupported, ", ")}
+		}
+		spanWhere = f.Where
+	}
+	if split.Trace == nil {
+		return spanWhere, nil
+	}
+	traceWhere, err := e.traceFilter(ctx, split, spanWhere, start, end)
+	if err != nil {
+		return "", err
+	}
+	return apl.And(spanWhere, traceWhere), nil
 }
 
 // valueExpr renders the attribute an aggregation operates on as a
@@ -290,7 +321,9 @@ func (e *Evaluator) valueExpr(a traceql.Attribute) (string, bool, error) {
 
 func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuery, req Request) ([]*series, error) {
 	m := e.tr.Mapping()
-	where, err := e.filterWhere(mq)
+	start := time.Unix(0, int64(req.StartNs))
+	end := time.Unix(0, int64(req.EndNs))
+	where, err := e.filterWhere(ctx, mq, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -359,8 +392,6 @@ func (e *Evaluator) evalAggregate(ctx context.Context, mq *translate.MetricsQuer
 	q.Summarize(aggs, byCols)
 	q.Sort("_bucket asc")
 
-	start := time.Unix(0, int64(req.StartNs))
-	end := time.Unix(0, int64(req.EndNs))
 	res, err := e.run(ctx, q.String(), start, end)
 	if err != nil {
 		return nil, err

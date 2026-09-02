@@ -42,6 +42,18 @@ search, tag autocomplete, and the RED metrics panels.
   than that are only matched on their first eight.
 - **Metrics** are translated to native APL `summarize ... by bin(_time, step)`
   aggregations, so they scale with Axiom rather than with the proxy.
+- **Trace-level intrinsics in metrics** (`traceDuration`/`trace:duration`,
+  `rootName`/`trace:rootName`, `rootServiceName`/`trace:rootService`) are
+  properties of a whole trace, so no single row can be tested for them.
+  The filter is split at its top-level `&&`: the trace-level part is
+  resolved first by a per-trace aggregation (`summarize … by trace_id`),
+  and the qualifying trace ids are inlined into the metrics query as
+  `trace_id in (…)`. `{ traceDuration > 2s } | rate()`,
+  `{ rootServiceName = "web" && status = error } | rate() by (name)` and
+  `{ trace:rootName = "GET /x" } | quantile_over_time(duration, .9)` all
+  work. Limits, and when a query is refused with a 400 instead of
+  returning partial numbers, are in
+  [docs/DESIGN.md](docs/DESIGN.md#trace-level-intrinsics-in-metrics).
 - The dataset's field list is discovered at startup (and refreshed) so
   attributes that Axiom flattens (`attributes.http.method`) and attributes
   kept in the `attributes.custom` map are both addressed correctly.
@@ -90,6 +102,7 @@ token can read is accepted.
 | `PROXY_MAX_SEARCH_TRACES` | `-max-search-traces` | `500` | cap on candidate traces per search |
 | `PROXY_MAX_SPANS_PER_FETCH` | `-max-spans-per-fetch` | `50000` | cap on spans pulled per query |
 | `PROXY_MAX_TAG_VALUES` | `-max-tag-values` | `5000` | cap on tag values |
+| `PROXY_MAX_TRACE_INTRINSIC_TRACES` | `-max-trace-intrinsic-traces` | `5000` | cap on traces a trace-level metrics filter may resolve to |
 | `PROXY_SCHEMA_REFRESH` | `-schema-refresh` | `5m` | schema re-discovery interval |
 | `PROXY_QUERY_TIMEOUT` | `-query-timeout` | `60s` | per-request timeout |
 | `PROXY_LOG_QUERIES` | `-log-queries` | `false` | log every generated APL query |
