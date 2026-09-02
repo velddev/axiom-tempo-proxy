@@ -19,13 +19,23 @@ internal/translate      TraceQL AST -> APL where predicates; metrics-stage parse
 internal/fetch          traceql.SpansetFetcher backed by Axiom (search path)
 internal/metrics        TraceQL metrics -> native APL summarize queries
 internal/convert        Axiom rows -> OTLP protobuf trace (trace by id)
-internal/server         Tempo HTTP handlers, param parsing, jsonpb/proto encoding
+internal/server         Tempo HTTP handlers, the StreamingQuerier gRPC service,
+                        param parsing, jsonpb/proto encoding
 ```
 
 The Tempo module (`github.com/grafana/tempo@main`) is a dependency. It
 provides the TraceQL parser and execution engine, the protobuf/jsonpb
 response types, and the id helpers, so response encoding is byte-for-byte
 what Tempo produces.
+
+Every query endpoint has one implementation shared by both transports: a
+`run*` function on the server takes the parsed request and returns the
+tempopb response or an error. The HTTP handler parses query parameters
+and writes the message; the gRPC method reads the same request off the
+wire and sends it as the single final message of the stream. Errors carry
+their HTTP status (`statusError`, `queryErrorStatus`) and the gRPC side
+maps that status to a code, so both transports classify failures the same
+way.
 
 ## Query strategies
 

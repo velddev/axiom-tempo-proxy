@@ -19,7 +19,7 @@ search, tag autocomplete, and the RED metrics panels.
 | `GET /api/search/tag/{tag}/values`, v2 | yes, with `q` filter pushdown |
 | `GET /api/metrics/query_range`, `GET /api/metrics/query` | yes: `rate`, `count_over_time`, `min/max/avg/sum_over_time`, `quantile_over_time`, `histogram_over_time`, `compare`, `topk`/`bottomk`, comparisons, `by()`, arithmetic between queries |
 | Service graph / span metrics | no (Grafana reads those from Prometheus) |
-| gRPC streaming | no (disable streaming on the datasource) |
+| gRPC streaming (`tempopb.StreamingQuerier`) | yes, on the same port (see below) |
 
 ## How it works
 
@@ -58,6 +58,15 @@ search, tag autocomplete, and the RED metrics panels.
   attribute keys found in the data, and tag values for
   `event.<key>`/`event:name` expand the array (`mv-expand`) after the
   `q` filter has been pushed down, so they come back as strings.
+- **Streaming** serves Tempo's `StreamingQuerier` gRPC service on the same
+  port as the HTTP API. Requests arriving as cleartext HTTP/2 (h2c) with a
+  `application/grpc` content type are routed to the gRPC server, everything
+  else to the HTTP mux, so HTTP/1.1 behaviour is unchanged. Each streaming
+  method does the same work as its HTTP handler and sends exactly one final
+  message with the complete result; Tempo sends progressive partial results
+  instead, and Grafana keeps the last message either way. Streamed
+  responses carry the same `droppedTraces` metric, `PARTIAL` status and
+  exemplars as the HTTP ones.
 - **Metrics** are translated to native APL `summarize ... by bin(_time, step)`
   aggregations, so they scale with Axiom rather than with the proxy.
 - **Exemplars** (the clickable trace dots on RED and breakdown panels)
@@ -102,6 +111,28 @@ Datasets are per environment. A request picks its dataset in this order:
 `AXIOM_DATASET` is optional. Restrict which datasets a request may select
 with `PROXY_ALLOWED_DATASETS=prod,staging`; without it any dataset the
 token can read is accepted.
+
+### Streaming
+
+Grafana's Tempo datasource uses gRPC streaming for search and metrics when
+**Streaming** is enabled on the datasource. The proxy serves
+`tempopb.StreamingQuerier` (`Search`, `SearchTags`, `SearchTagsV2`,
+`SearchTagValues`, `SearchTagValuesV2`, `MetricsQueryRange`,
+`MetricsQueryInstant`) over h2c on the listen address, so no extra port or
+configuration is needed.
+
+**The URL prefix does not work for streaming.** Grafana appends `/api/...`
+to the datasource URL for HTTP calls, but for gRPC it only dials the URL's
+host and port: a datasource URL like `http://proxy:3200/prod` cannot carry
+the `prod` prefix over gRPC. Streaming users must therefore either
+
+- set a custom datasource header `X-Axiom-Dataset: prod` (Grafana forwards
+  custom headers as gRPC metadata, and the proxy also accepts a plain
+  `dataset` metadata key), or
+- run a proxy with `AXIOM_DATASET` set to that dataset,
+
+otherwise streaming calls fail with `InvalidArgument: no dataset`. HTTP
+calls keep accepting the URL prefix and the `?dataset=` parameter.
 
 ### Configuration
 

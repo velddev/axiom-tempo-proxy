@@ -6,6 +6,8 @@ require (
 	github.com/gogo/protobuf v1.3.2
 	github.com/grafana/tempo v1.5.1-0.20260831115516-bf9dbd054c59
 	github.com/prometheus/common v0.70.1
+	golang.org/x/net v0.58.0
+	google.golang.org/grpc v1.82.1
 )
 
 require (
@@ -101,7 +103,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/mod v0.40.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
@@ -110,6 +111,5 @@ require (
 	golang.org/x/tools v0.49.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260630182238-925bb5da69e7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7 // indirect
-	google.golang.org/grpc v1.82.1 // indirect
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 )
