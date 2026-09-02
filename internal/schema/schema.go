@@ -200,6 +200,44 @@ func (m *Mapping) EventSlots(name string) ([]string, bool) {
 	return out, true
 }
 
+// ExpandedEvent returns the APL expression for one field of a single event
+// row, as produced by an `mv-expand <events>` stage. APL rejects an alias
+// on mv-expand ("expand doesn't currently support aliases"), so after the
+// expansion the column keeps its own name and holds one element. An empty
+// name addresses the event's own name, as EventSlots does.
+func (m *Mapping) ExpandedEvent(name string) (string, bool) {
+	ev := m.Events()
+	if ev.Missing {
+		return "", false
+	}
+	if name == "" {
+		return ev.Expr + "['name']", true
+	}
+	return ev.Expr + "['attributes']['" + escapeKey(name) + "']", true
+}
+
+// ExpandedEventAttributes returns the APL expression for the attribute bag
+// of a single expanded event row, for key enumeration with bag_keys.
+func (m *Mapping) ExpandedEventAttributes() (string, bool) {
+	ev := m.Events()
+	if ev.Missing {
+		return "", false
+	}
+	return ev.Expr + "['attributes']", true
+}
+
+// ExpandedLinkAttributes is ExpandedEventAttributes for the links array.
+// Datasets ingested by Axiom's OTel exporters do not always have a links
+// column, so callers must check the bool before referencing it: APL fails
+// a query outright when it names a field the dataset does not have.
+func (m *Mapping) ExpandedLinkAttributes() (string, bool) {
+	ln := m.Links()
+	if ln.Missing {
+		return "", false
+	}
+	return ln.Expr + "['attributes']", true
+}
+
 func escapeKey(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	return strings.ReplaceAll(s, `'`, `\'`)

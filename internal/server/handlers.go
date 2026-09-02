@@ -324,6 +324,11 @@ func (s *Server) handleSearchTags(w http.ResponseWriter, r *http.Request) {
 	if !m.Discovered() {
 		resTags = uniqueSorted(append(resTags, "service.name"))
 	}
+	// Event and link attributes are not columns: their keys are sampled
+	// out of the arrays at schema discovery, and stay empty for a dataset
+	// that has no such array at all.
+	eventTags := uniqueSorted(ds.eventKeys)
+	linkTags := uniqueSorted(ds.linkKeys)
 	cap_ := func(tags []string) []string {
 		if limit > 0 && len(tags) > int(limit) {
 			return tags[:limit]
@@ -347,6 +352,8 @@ func (s *Server) handleSearchTags(w http.ResponseWriter, r *http.Request) {
 		}
 		add("resource", resTags)
 		add("span", spanTags)
+		add("event", eventTags)
+		add("link", linkTags)
 		add("intrinsic", intrinsicTags)
 		s.writeMessage(w, r, res, false)
 		return
@@ -398,6 +405,13 @@ func (s *Server) handleSearchTagValues(w http.ResponseWriter, r *http.Request) {
 		attr = a
 	} else {
 		attr = traceql.NewAttribute(tagName)
+		// Event attributes have no unscoped spelling, so accept the scoped
+		// one (event.exception.message, event:name) on v1 too.
+		if a, err := traceql.ParseIdentifier(tagName); err == nil {
+			if _, isEvent := eventAttribute(a); isEvent {
+				attr = a
+			}
+		}
 	}
 	limit, err := parseUint(r, "limit", uint32(s.cfg.MaxTagValues))
 	if err != nil {
@@ -445,19 +459,35 @@ func (s *Server) handleSearchTagValues(w http.ResponseWriter, r *http.Request) {
 // unfiltered list is returned, as Tempo does for incomplete queries.
 func (s *Server) tagValues(ctx context.Context, ds *datasetSchema, attr traceql.Attribute, filter string, limit int, start, end time.Time) ([]traceql.Static, error) {
 	m := ds.mapping
-	col, ok := m.Resolve(attr)
-	if !ok {
-		switch attr.Intrinsic {
-		case traceql.IntrinsicTraceRootService, traceql.ScopedIntrinsicTraceRootService:
-			col = m.ServiceName()
-			ok = true
-		case traceql.IntrinsicTraceRootSpan, traceql.ScopedIntrinsicTraceRootName:
-			col = m.Name()
-			ok = true
+
+	// Event attributes are not per-span columns: their values live inside
+	// the events array, so those rows are expanded and grouped instead.
+	eventKey, isEvent := eventAttribute(attr)
+	var valueExpr string
+	if isEvent {
+		expr, ok := m.ExpandedEvent(eventKey)
+		if !ok {
+			return nil, nil
 		}
-	}
-	if !ok || col.Missing {
-		return nil, nil
+		// APL refuses to group by a value of unknown type, which is what
+		// indexing into a dynamic yields, so every event value is a string.
+		valueExpr = apl.Call("tostring", expr)
+	} else {
+		col, ok := m.Resolve(attr)
+		if !ok {
+			switch attr.Intrinsic {
+			case traceql.IntrinsicTraceRootService, traceql.ScopedIntrinsicTraceRootService:
+				col = m.ServiceName()
+				ok = true
+			case traceql.IntrinsicTraceRootSpan, traceql.ScopedIntrinsicTraceRootName:
+				col = m.Name()
+				ok = true
+			}
+		}
+		if !ok || col.Missing {
+			return nil, nil
+		}
+		valueExpr = col.Expr
 	}
 
 	q := apl.NewQuery(ds.name).Where(m.SpansOnly())
@@ -470,9 +500,20 @@ func (s *Server) tagValues(ctx context.Context, ds *datasetSchema, attr traceql.
 			s.log.Debug("ignoring unparsable tag value filter", "q", filter, "err", err)
 		}
 	}
-	q.Where(apl.Call("isnotnull", col.Expr)).
-		Summarize([]string{"c = count()"}, []string{"v = " + col.Expr}).
-		Top(limit, "c")
+	if isEvent {
+		// The q filter is pushed down ahead of the expansion, where the
+		// per-slot event expressions it may carry are still meaningful.
+		events := m.Events().Expr
+		q.Where(apl.Call("isnotnull", events)).
+			Raw("mv-expand "+events).
+			Extend("v = "+valueExpr).
+			Where(apl.Call("isnotempty", "v")).
+			Summarize([]string{"c = count()"}, []string{"v"})
+	} else {
+		q.Where(apl.Call("isnotnull", valueExpr)).
+			Summarize([]string{"c = count()"}, []string{"v = " + valueExpr})
+	}
+	q.Top(limit, "c")
 	query := q.String()
 	if s.cfg.LogQueries {
 		s.log.Info("axiom query", "apl", query)
@@ -505,6 +546,24 @@ func (s *Server) tagValues(ctx context.Context, ds *datasetSchema, attr traceql.
 		out = append(out, st)
 	}
 	return out, nil
+}
+
+// eventAttribute reports whether an attribute addresses span event data,
+// returning the event attribute key, empty for the event's own name
+// (event:name). Event intrinsics other than the name, such as
+// event:timeSinceStart, are not event attributes here: they are not
+// derivable from the stored elements.
+func eventAttribute(a traceql.Attribute) (string, bool) {
+	if a.Parent {
+		return "", false
+	}
+	if a.Intrinsic == traceql.IntrinsicEventName {
+		return "", true
+	}
+	if a.Intrinsic == traceql.IntrinsicNone && a.Scope == traceql.AttributeScopeEvent {
+		return a.Name, true
+	}
+	return "", false
 }
 
 func normaliseIntrinsicValue(attr traceql.Attribute, st traceql.Static) traceql.Static {
