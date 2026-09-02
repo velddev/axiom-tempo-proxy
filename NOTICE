@@ -1,0 +1,10 @@
+axiom-tempo-proxy
+
+Licensed under the GNU Affero General Public License, version 3 only.
+See LICENSE.
+
+This program links the TraceQL parser and engine from Grafana Tempo
+(https://github.com/grafana/tempo), which is licensed under the
+AGPL-3.0-only, and Tempo's protobuf definitions (pkg/tempopb), which are
+licensed under the Apache License 2.0. Their copyright notices are
+preserved in the respective module sources.
