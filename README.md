@@ -27,7 +27,11 @@ search, tag autocomplete, and the RED metrics panels.
 - **Search** pushes the query's spanset filters down to APL to find
   candidate traces, pulls the spans of those traces, and runs Tempo's own
   TraceQL engine in-process over them. Structural operators, aggregates,
-  `select`, `by`, and `coalesce` all work exactly as in Tempo.
+  `select`, `by`, and `coalesce` all work exactly as in Tempo. The span
+  pull `project`s only the columns the query needs — the intrinsics, the
+  resource identity, and the columns backing the attributes the query
+  filters on or `select`s — so a 183-column dataset moves a fraction of
+  the bytes. Trace by id still fetches every column.
 - **Search ranking**: a search returns at most `limit` traces, newest
   first. When the query `select()`s attributes (Drilldown's Exceptions tab
   selects `event.exception.*`), traces that actually carry those

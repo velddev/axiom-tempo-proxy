@@ -6,9 +6,10 @@
 // spans are filtered by the union of the query's spanset filters, counted
 // per trace and per filter, and traces are kept when the counts satisfy
 // the query's spanset structure (both sides present for && and structural
-// operators, either side for ||). The second pulls every span of those
-// traces. Spans are grouped into spansets and handed to the engine's
-// second pass, which applies the full TraceQL semantics.
+// operators, either side for ||). The second pulls the spans of those
+// traces, projecting only the columns the query's attributes need. Spans
+// are grouped into spansets and handed to the engine's second pass, which
+// applies the full TraceQL semantics.
 package fetch
 
 import (
@@ -131,7 +132,10 @@ func (f *Fetcher) Fetch(ctx context.Context, req traceql.FetchSpansRequest) (tra
 		return traceql.FetchSpansResponse{Results: &iterator{}, Stats: f.fetchStats}, nil
 	}
 
-	traces, err := f.pullTraces(ctx, ids, start, end)
+	// The pull only needs the columns backing the attributes this request
+	// exposes; a real dataset has hundreds of columns and a query touches
+	// a handful of them.
+	traces, err := f.pullTraces(ctx, ids, start, end, projectColumns(f.tr.Mapping(), req))
 	if err != nil {
 		return traceql.FetchSpansResponse{}, err
 	}
@@ -228,12 +232,14 @@ func (f *Fetcher) candidates(ctx context.Context, start, end time.Time) ([]strin
 	return ids, nil
 }
 
-// pullTraces fetches all spans of the candidate traces and groups them,
-// preserving the candidate order.
-func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.Time) ([]*spans.Trace, error) {
+// pullTraces fetches the spans of the candidate traces and groups them,
+// preserving the candidate order. cols, when non-empty, restricts the
+// pull to those dataset columns.
+func (f *Fetcher) pullTraces(ctx context.Context, ids []string, start, end time.Time, cols []string) ([]*spans.Trace, error) {
 	m := f.tr.Mapping()
 	q := apl.NewQuery(f.opts.Dataset).
 		Where(translate.TraceIDsFilter(m, ids)).
+		Project(projectExprs(cols)...).
 		Limit(f.opts.MaxSpans)
 
 	res, err := f.run(ctx, q.String(), start.Add(-f.opts.TracePadding), end.Add(f.opts.TracePadding))
@@ -520,7 +526,8 @@ func (p *plan) operationWhere(tr *translate.Translator, op *traceql.SpansetOpera
 	return "", false
 }
 
-// FetchTrace pulls one trace by hex id within the window.
+// FetchTrace pulls one trace by hex id within the window. It never
+// projects: the trace view shows every attribute a span carries.
 func FetchTrace(ctx context.Context, client *axiom.Client, tr *translate.Translator, opts Options, hexID string, start, end time.Time) (*spans.Trace, error) {
 	opts = opts.withDefaults()
 	m := tr.Mapping()

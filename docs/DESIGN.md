@@ -37,12 +37,24 @@ protobuf or jsonpb depending on the Accept header.
 **Search (TraceQL).** Hybrid. The spanset filter is translated into an APL
 predicate used as a *prefilter* (exact when possible, a superset
 otherwise). Query 1 finds candidate trace ids matching the prefilter
-(ordered by recency, limited). Query 2 pulls all spans of those traces.
+(ordered by recency, limited). Query 2 pulls the spans of those traces.
 The spans are wrapped in `traceql.Spanset`s with nested-set bounds
 computed in memory, and Tempo's own engine (`Engine.ExecuteSearch`)
 evaluates the full query, including structural operators, aggregates,
 `select`, `by`, and `coalesce`. This gives exact TraceQL semantics with
 bounded data transfer.
+
+Query 2 `project`s only the columns the fetch request needs: every
+intrinsic the dataset has, the top-level resource fields (`service.*`,
+`telemetry.*`), and the columns backing the attributes the request
+references — a flat column, a custom map when the attribute lives in one,
+`events`/`links` for event- and link-scoped attributes. The engine only
+ever reports the attributes the query mentioned (`spans.AttrSet`, derived
+from the same conditions), so the projection cannot change results. It is
+skipped when the request selects every attribute or when the schema was
+not discovered, since a `project` naming a column the dataset lacks fails
+the query with a 400. Trace by id never projects: the trace view shows
+everything.
 
 **Metrics (TraceQL metrics).** Native APL. The metrics stage is parsed
 (`rate`, `count_over_time`, `*_over_time`, `quantile_over_time`,

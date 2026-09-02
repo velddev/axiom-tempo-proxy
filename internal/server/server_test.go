@@ -192,6 +192,54 @@ func spanRows(traceIDs ...string) [][]any {
 	return out
 }
 
+// projectStage returns the columns of a query's project stage, with the
+// APL quoting stripped, or nil when the query has no project stage.
+func projectStage(apl string) []string {
+	for _, line := range strings.Split(apl, "\n") {
+		stage := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "|"))
+		if !strings.HasPrefix(stage, "project ") {
+			continue
+		}
+		var out []string
+		for _, c := range strings.Split(strings.TrimPrefix(stage, "project "), ",") {
+			c = strings.TrimSpace(c)
+			c = strings.TrimSuffix(strings.TrimPrefix(c, "['"), "']")
+			out = append(out, c)
+		}
+		return out
+	}
+	return nil
+}
+
+// applyProject drops the columns a query's project stage did not ask for.
+func applyProject(apl string, fields []axiom.Field, rows [][]any) ([]axiom.Field, [][]any) {
+	want := projectStage(apl)
+	if want == nil {
+		return fields, rows
+	}
+	keep := map[string]bool{}
+	for _, w := range want {
+		keep[w] = true
+	}
+	var idx []int
+	outFields := make([]axiom.Field, 0, len(want))
+	for i, f := range fields {
+		if keep[f.Name] {
+			idx = append(idx, i)
+			outFields = append(outFields, f)
+		}
+	}
+	out := make([][]any, 0, len(rows))
+	for _, r := range rows {
+		nr := make([]any, 0, len(idx))
+		for _, i := range idx {
+			nr = append(nr, r[i])
+		}
+		out = append(out, nr)
+	}
+	return outFields, out
+}
+
 // defaultRespond answers the query shapes the proxy generates.
 func defaultRespond(apl string) ([]axiom.Field, [][]any) {
 	switch {
@@ -216,7 +264,9 @@ func defaultRespond(apl string) ([]axiom.Field, [][]any) {
 				ids = append(ids, id)
 			}
 		}
-		return spanFields(), spanRows(ids...)
+		// Honour the project stage as Axiom does, so the tests exercise
+		// parsing of the projected subset rather than of every column.
+		return applyProject(apl, spanFields(), spanRows(ids...))
 	case strings.Contains(apl, "summarize m0"):
 		// Candidate traces: return both and let the engine decide, which is
 		// what happens when the prefilter is a superset.
