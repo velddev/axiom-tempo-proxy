@@ -192,17 +192,18 @@ func (f *Fetcher) candidates(ctx context.Context, start, end time.Time) ([]strin
 	if f.opts.NoPreferSelected {
 		prefer = nil
 	}
-	if len(prefer) > 0 {
-		present := make([]string, len(prefer))
-		for i, c := range prefer {
-			present[i] = apl.Call("isnotnull", c)
-		}
-		aggs = append(aggs, "sel = countif("+apl.Or(present...)+")")
+	// Score each trace by how many of the selected attributes it carries,
+	// so a trace with a service name and an exception event outranks one
+	// with only the (ubiquitous) service name.
+	scores := make([]string, 0, len(prefer))
+	for i, c := range prefer {
+		aggs = append(aggs, fmt.Sprintf("s%d = countif(%s)", i, apl.Call("isnotnull", c)))
+		scores = append(scores, fmt.Sprintf("iff(s%d > 0, 1, 0)", i))
 	}
 	q.Summarize(aggs, []string{m.TraceID().Expr})
 	q.Where(f.plan.traceWhere)
-	if len(prefer) > 0 {
-		q.Extend("_pref = iff(sel > 0, 1, 0)")
+	if len(scores) > 0 {
+		q.Extend("_pref = " + strings.Join(scores, " + "))
 		q.Sort("_pref desc", "start desc")
 	} else {
 		q.Sort("start desc")

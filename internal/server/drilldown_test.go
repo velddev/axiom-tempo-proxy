@@ -99,8 +99,8 @@ func TestDrilldownExceptionsQuery(t *testing.T) {
 	// Traces carrying the selected event attributes are ranked first so a
 	// bounded result is not dominated by exception-free errors.
 	cand := h.fake.find("summarize m0")
-	if !strings.Contains(cand, "sel = countif((isnotnull(events)) or (isnotnull(['service.name'])))") ||
-		!strings.Contains(cand, "| extend _pref = iff(sel > 0, 1, 0)\n| sort by _pref desc, start desc") {
+	if !strings.Contains(cand, "s0 = countif(isnotnull(['service.name'])), s1 = countif(isnotnull(events))") ||
+		!strings.Contains(cand, "| extend _pref = iff(s0 > 0, 1, 0) + iff(s1 > 0, 1, 0)\n| sort by _pref desc, start desc") {
 		t.Errorf("candidate query should prefer traces with selected attributes:\n%s", cand)
 	}
 }
