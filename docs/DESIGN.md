@@ -37,12 +37,27 @@ protobuf or jsonpb depending on the Accept header.
 **Search (TraceQL).** Hybrid. The spanset filter is translated into an APL
 predicate used as a *prefilter* (exact when possible, a superset
 otherwise). Query 1 finds candidate trace ids matching the prefilter
-(ordered by recency, limited). Query 2 pulls all spans of those traces.
-The spans are wrapped in `traceql.Spanset`s with nested-set bounds
-computed in memory, and Tempo's own engine (`Engine.ExecuteSearch`)
-evaluates the full query, including structural operators, aggregates,
-`select`, `by`, and `coalesce`. This gives exact TraceQL semantics with
-bounded data transfer.
+(ordered by recency, limited). The queries after it pull the spans of
+those traces in batches of candidate ids (`PROXY_SEARCH_BATCH_TRACES`, one
+query when they all fit), in candidate order, until the span budget
+(`PROXY_MAX_SPANS_PER_FETCH`) is spent. The spans are wrapped in
+`traceql.Spanset`s with nested-set bounds computed in memory, and Tempo's
+own engine (`Engine.ExecuteSearch`) evaluates the full query, including
+structural operators, aggregates, `select`, `by`, and `coalesce`. This
+gives exact TraceQL semantics with bounded data transfer.
+
+**Partial results.** A half-fetched trace is worse than a missing one: it
+makes structural operators and aggregates lie. So each batch asks for one
+row more than the budget allows and sorts by `trace_id`, which makes an
+overflow both detectable and aligned to a trace boundary — the trailing
+trace, and every candidate behind it, is dropped rather than returned
+incomplete. Dropped candidates are counted in `fetch.Stats` and reported
+as `metrics.additionalMetrics.droppedTraces` on the search response
+(`SearchResponse` has no status field), plus a warning log carrying the
+query. Where the protobuf does have a status it is used: metrics
+`query_range`/`query` and trace-by-id v2 set `PARTIAL` with a message when
+a trace hit the span cap or Axiom's result reports `status.isPartial`, and
+Axiom's status messages are passed through in that message.
 
 **Metrics (TraceQL metrics).** Native APL. The metrics stage is parsed
 (`rate`, `count_over_time`, `*_over_time`, `quantile_over_time`,

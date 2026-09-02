@@ -38,8 +38,12 @@ type Config struct {
 
 	// MaxSearchTraces caps the traces returned by a search.
 	MaxSearchTraces int
-	// MaxSpansPerFetch caps spans pulled from Axiom per query.
+	// MaxSpansPerFetch caps the spans pulled from Axiom for one search
+	// (across all of its batches) or one trace-by-id query.
 	MaxSpansPerFetch int
+	// SearchBatchTraces is how many candidate trace ids one span-pull
+	// query of a search asks for.
+	SearchBatchTraces int
 	// MaxTagValues caps values returned for tag autocomplete.
 	MaxTagValues int
 	// TagSampleRows is how many rows are sampled to discover map keys.
@@ -65,18 +69,19 @@ type Config struct {
 // Default returns the default configuration.
 func Default() Config {
 	return Config{
-		ListenAddr:       ":3200",
-		AxiomURL:         "https://api.axiom.co",
-		DatasetHeader:    "X-Axiom-Dataset",
-		SchemaRefresh:    5 * time.Minute,
-		MaxSearchTraces:  500,
-		MaxSpansPerFetch: 50000,
-		MaxTagValues:     5000,
-		TagSampleRows:    2000,
-		DefaultLookback:  time.Hour,
-		TraceLookback:    24 * time.Hour,
-		QueryTimeout:     60 * time.Second,
-		LogLevel:         "info",
+		ListenAddr:        ":3200",
+		AxiomURL:          "https://api.axiom.co",
+		DatasetHeader:     "X-Axiom-Dataset",
+		SchemaRefresh:     5 * time.Minute,
+		MaxSearchTraces:   500,
+		MaxSpansPerFetch:  50000,
+		SearchBatchTraces: 50,
+		MaxTagValues:      5000,
+		TagSampleRows:     2000,
+		DefaultLookback:   time.Hour,
+		TraceLookback:     24 * time.Hour,
+		QueryTimeout:      60 * time.Second,
+		LogLevel:          "info",
 	}
 }
 
@@ -134,6 +139,7 @@ func Load(args []string) (Config, error) {
 		envDur("PROXY_QUERY_TIMEOUT", &c.QueryTimeout),
 		envInt("PROXY_MAX_SEARCH_TRACES", &c.MaxSearchTraces),
 		envInt("PROXY_MAX_SPANS_PER_FETCH", &c.MaxSpansPerFetch),
+		envInt("PROXY_SEARCH_BATCH_TRACES", &c.SearchBatchTraces),
 		envInt("PROXY_MAX_TAG_VALUES", &c.MaxTagValues),
 		envInt("PROXY_TAG_SAMPLE_ROWS", &c.TagSampleRows),
 	} {
@@ -156,7 +162,8 @@ func Load(args []string) (Config, error) {
 	fs.DurationVar(&c.TraceLookback, "trace-lookback", c.TraceLookback, "trace-by-id window when none is given")
 	fs.DurationVar(&c.QueryTimeout, "query-timeout", c.QueryTimeout, "per-query timeout")
 	fs.IntVar(&c.MaxSearchTraces, "max-search-traces", c.MaxSearchTraces, "cap on traces per search")
-	fs.IntVar(&c.MaxSpansPerFetch, "max-spans-per-fetch", c.MaxSpansPerFetch, "cap on spans pulled per query")
+	fs.IntVar(&c.MaxSpansPerFetch, "max-spans-per-fetch", c.MaxSpansPerFetch, "cap on spans pulled per search or trace")
+	fs.IntVar(&c.SearchBatchTraces, "search-batch-traces", c.SearchBatchTraces, "candidate traces per span-pull query")
 	fs.IntVar(&c.MaxTagValues, "max-tag-values", c.MaxTagValues, "cap on tag values")
 	fs.IntVar(&c.TagSampleRows, "tag-sample-rows", c.TagSampleRows, "rows sampled to discover map keys")
 	if err := fs.Parse(args); err != nil {
