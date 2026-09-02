@@ -52,6 +52,10 @@ type Config struct {
 	// QueryTimeout bounds one Axiom query.
 	QueryTimeout time.Duration
 
+	// NoPreferSelected disables ranking search candidates that carry the
+	// attributes a query select()s ahead of those that do not.
+	NoPreferSelected bool
+
 	// LogLevel is debug, info, warn, or error.
 	LogLevel string
 	// LogQueries logs every generated APL query.
@@ -100,6 +104,9 @@ func Load(args []string) (Config, error) {
 	if v, ok := os.LookupEnv("PROXY_LOG_QUERIES"); ok {
 		c.LogQueries = v == "1" || strings.EqualFold(v, "true")
 	}
+	if v, ok := os.LookupEnv("PROXY_NO_PREFER_SELECTED"); ok {
+		c.NoPreferSelected = v == "1" || strings.EqualFold(v, "true")
+	}
 	envDur := func(key string, dst *time.Duration) error {
 		if v, ok := os.LookupEnv(key); ok {
 			d, err := time.ParseDuration(v)
@@ -143,6 +150,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&c.DatasetHeader, "dataset-header", c.DatasetHeader, "request header that selects the dataset")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level")
 	fs.BoolVar(&c.LogQueries, "log-queries", c.LogQueries, "log generated APL queries")
+	fs.BoolVar(&c.NoPreferSelected, "no-prefer-selected", c.NoPreferSelected, "do not rank search candidates carrying select()ed attributes first")
 	fs.DurationVar(&c.SchemaRefresh, "schema-refresh", c.SchemaRefresh, "dataset schema refresh interval")
 	fs.DurationVar(&c.DefaultLookback, "default-lookback", c.DefaultLookback, "search window when none is given")
 	fs.DurationVar(&c.TraceLookback, "trace-lookback", c.TraceLookback, "trace-by-id window when none is given")

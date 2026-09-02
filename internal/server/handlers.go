@@ -70,13 +70,14 @@ func (s *Server) requestContext(w http.ResponseWriter, r *http.Request) (context
 
 func (s *Server) fetchOptions(ds *datasetSchema) fetch.Options {
 	return fetch.Options{
-		Dataset:         ds.name,
-		MaxTraces:       s.cfg.MaxSearchTraces,
-		MaxSpans:        s.cfg.MaxSpansPerFetch,
-		DefaultLookback: s.cfg.DefaultLookback,
-		TracePadding:    time.Hour,
-		Log:             s.log,
-		LogQueries:      s.cfg.LogQueries,
+		Dataset:          ds.name,
+		MaxTraces:        s.cfg.MaxSearchTraces,
+		MaxSpans:         s.cfg.MaxSpansPerFetch,
+		DefaultLookback:  s.cfg.DefaultLookback,
+		TracePadding:     time.Hour,
+		NoPreferSelected: s.cfg.NoPreferSelected,
+		Log:              s.log,
+		LogQueries:       s.cfg.LogQueries,
 	}
 }
 

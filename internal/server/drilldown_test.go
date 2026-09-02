@@ -96,6 +96,23 @@ func TestDrilldownExceptionsQuery(t *testing.T) {
 	if vals["exception.message"] != "boom" || vals["exception.type"] != "DbError" || vals["service.name"] != "backend" {
 		t.Errorf("exception attrs = %v", vals)
 	}
+	// Traces carrying the selected event attributes are ranked first so a
+	// bounded result is not dominated by exception-free errors.
+	cand := h.fake.find("summarize m0")
+	if !strings.Contains(cand, "sel = countif((isnotnull(events)) or (isnotnull(['service.name'])))") ||
+		!strings.Contains(cand, "| extend _pref = iff(sel > 0, 1, 0)\n| sort by _pref desc, start desc") {
+		t.Errorf("candidate query should prefer traces with selected attributes:\n%s", cand)
+	}
+}
+
+func TestSearchWithoutSelectKeepsRecencyOrder(t *testing.T) {
+	h := newHarness(t, nil)
+	var res map[string]any
+	h.getJSON(t, fmt.Sprintf("/api/search?q=%s&start=%d&end=%d", url.QueryEscape(`{ status = error }`), t0.Add(-time.Hour).Unix(), t0.Add(time.Hour).Unix()), &res)
+	cand := h.fake.find("summarize m0")
+	if strings.Contains(cand, "_pref") || !strings.Contains(cand, "| sort by start desc") {
+		t.Errorf("unexpected ranking without select():\n%s", cand)
+	}
 }
 
 func TestDrilldownDurationAndSpanFilters(t *testing.T) {

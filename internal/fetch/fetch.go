@@ -25,6 +25,7 @@ import (
 
 	"github.com/velddev/axiom-tempo-proxy/internal/apl"
 	"github.com/velddev/axiom-tempo-proxy/internal/axiom"
+	"github.com/velddev/axiom-tempo-proxy/internal/schema"
 	"github.com/velddev/axiom-tempo-proxy/internal/spans"
 	"github.com/velddev/axiom-tempo-proxy/internal/translate"
 )
@@ -41,8 +42,11 @@ type Options struct {
 	// TracePadding widens the span pull window so spans of a candidate
 	// trace that fall outside the search window are still returned.
 	TracePadding time.Duration
-	Log          *slog.Logger
-	LogQueries   bool
+	// NoPreferSelected disables ranking candidate traces that carry the
+	// attributes the query select()s ahead of those that do not.
+	NoPreferSelected bool
+	Log              *slog.Logger
+	LogQueries       bool
 }
 
 func (o Options) withDefaults() Options {
@@ -184,9 +188,25 @@ func (f *Fetcher) candidates(ctx context.Context, start, end time.Time) ([]strin
 		}
 	}
 	aggs = append(aggs, "start = min("+m.Time().Expr+")")
+	prefer := f.plan.prefer
+	if f.opts.NoPreferSelected {
+		prefer = nil
+	}
+	if len(prefer) > 0 {
+		present := make([]string, len(prefer))
+		for i, c := range prefer {
+			present[i] = apl.Call("isnotnull", c)
+		}
+		aggs = append(aggs, "sel = countif("+apl.Or(present...)+")")
+	}
 	q.Summarize(aggs, []string{m.TraceID().Expr})
 	q.Where(f.plan.traceWhere)
-	q.Sort("start desc")
+	if len(prefer) > 0 {
+		q.Extend("_pref = iff(sel > 0, 1, 0)")
+		q.Sort("_pref desc", "start desc")
+	} else {
+		q.Sort("start desc")
+	}
 	q.Limit(f.opts.MaxTraces)
 
 	res, err := f.run(ctx, q.String(), start, end)
@@ -309,7 +329,56 @@ type plan struct {
 	// traceWhere is the APL predicate over m<i> counts selecting traces.
 	traceWhere string
 	exact      bool
+	// prefer lists column expressions for attributes the query select()s.
+	// Candidate traces that have any of them are ranked before traces
+	// that do not, so a bounded result favours traces carrying the data
+	// the caller asked to see (Drilldown's Exceptions tab selects
+	// event.exception.* over the 400 most recent errored traces, which
+	// would otherwise be dominated by exception-free errors).
+	prefer []string
 }
+
+// selectedColumns maps the attributes a query select()s onto dataset
+// columns whose presence can be tested cheaply.
+func selectedColumns(tr *translate.Translator, query string) []string {
+	req, err := traceql.ExtractFetchSpansRequest(query)
+	if err != nil {
+		return nil
+	}
+	m := tr.Mapping()
+	seen := map[string]bool{}
+	var cols []string
+	add := func(c schemaColumn) {
+		if c.Missing || c.Expr == "" || seen[c.Expr] {
+			return
+		}
+		seen[c.Expr] = true
+		cols = append(cols, c.Expr)
+	}
+	for _, c := range req.SecondPassConditions {
+		if c.Op != traceql.OpNone {
+			continue
+		}
+		a := c.Attribute
+		switch {
+		case a.Scope == traceql.AttributeScopeEvent,
+			a.Intrinsic == traceql.IntrinsicEventName, a.Intrinsic == traceql.IntrinsicEventTimeSinceStart:
+			add(m.Events())
+		case a.Scope == traceql.AttributeScopeLink,
+			a.Intrinsic == traceql.IntrinsicLinkSpanID, a.Intrinsic == traceql.IntrinsicLinkTraceID:
+			add(m.Links())
+		case a.Intrinsic != traceql.IntrinsicNone:
+			// Intrinsics exist on every span; nothing to prefer.
+		default:
+			if col, ok := m.Resolve(a); ok {
+				add(col)
+			}
+		}
+	}
+	return cols
+}
+
+type schemaColumn = schema.Column
 
 func (p *plan) String() string {
 	var b strings.Builder
@@ -355,6 +424,7 @@ func buildPlan(tr *translate.Translator, query string) (*plan, error) {
 		// No spanset filter at all: match every trace.
 		p.filters = append(p.filters, translate.Filter{Exact: true})
 	}
+	p.prefer = selectedColumns(tr, query)
 	return p, nil
 }
 

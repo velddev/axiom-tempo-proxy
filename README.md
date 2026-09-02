@@ -28,6 +28,13 @@ search, tag autocomplete, and the RED metrics panels.
   candidate traces, pulls the spans of those traces, and runs Tempo's own
   TraceQL engine in-process over them. Structural operators, aggregates,
   `select`, `by`, and `coalesce` all work exactly as in Tempo.
+- **Search ranking**: a search returns at most `limit` traces, newest
+  first. When the query `select()`s attributes (Drilldown's Exceptions tab
+  selects `event.exception.*`), traces that actually carry those
+  attributes are ranked ahead of traces that don't, so the bounded result
+  shows the data the caller asked for instead of being dominated by, say,
+  exception-free errors. Every returned trace still matches the filter.
+  Disable with `PROXY_NO_PREFER_SELECTED=true`.
 - **Metrics** are translated to native APL `summarize ... by bin(_time, step)`
   aggregations, so they scale with Axiom rather than with the proxy.
 - The dataset's field list is discovered at startup (and refreshed) so
