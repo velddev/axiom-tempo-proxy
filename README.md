@@ -126,15 +126,16 @@ Flags override environment variables, which override the defaults.
 ## Deploying
 
 The `Dockerfile` builds a static binary into a distroless image listening
-on `:3200`.
-
-[`deploy/`](deploy/) contains a helper for Google Compute Engine. It
-installs the proxy as a systemd service over `gcloud compute ssh`:
+on `:3200`. The binary has no runtime dependencies, so it also runs fine
+as a plain systemd service; build it with:
 
 ```bash
-AXIOM_TOKEN=xaat-... AXIOM_DATASET=otel-traces-prod \
-  deploy/deploy.sh my-instance my-zone
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o axiom-tempo-proxy ./cmd/axiom-tempo-proxy
 ```
+
+Run it on the same host as Grafana, or anywhere Grafana can reach it, and
+bind it to a private interface: the proxy holds an Axiom token and has no
+authentication of its own.
 
 ## Development
 
